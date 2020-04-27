@@ -259,6 +259,8 @@ func (b *bucket) ErrorCode(err error) gcerrors.ErrorCode {
 			return gcerrors.NotFound
 		case http.StatusPreconditionFailed:
 			return gcerrors.FailedPrecondition
+		case http.StatusTooManyRequests:
+			return gcerrors.ResourceExhausted
 		}
 	}
 	return gcerrors.Unknown
