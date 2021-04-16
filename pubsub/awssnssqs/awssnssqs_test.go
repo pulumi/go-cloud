@@ -207,9 +207,9 @@ func createSQSQueue(ctx context.Context, sqsClient *sqs.SQS, topicName string) (
 	return qURL, qARN, nil
 }
 
-func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, error) {
+func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, func(), error) {
 	const fakeSubscriptionQueueURL = "https://" + region + ".amazonaws.com/" + accountNumber + "/nonexistent-subscription"
-	return openSubscription(ctx, h.sess, fakeSubscriptionQueueURL, nil), nil
+	return openSubscription(ctx, h.sess, fakeSubscriptionQueueURL, nil), func() {}, nil
 }
 
 func (h *harness) Close() {
@@ -352,6 +352,24 @@ func (t awsAsTest) BeforeSend(as func(interface{}) bool) error {
 	return nil
 }
 
+func (t awsAsTest) AfterSend(as func(interface{}) bool) error {
+	switch t.topicKind {
+	case topicKindSNS, topicKindSNSRaw:
+		var pub *sns.PublishOutput
+		if !as(&pub) {
+			return fmt.Errorf("cast failed for %T", &pub)
+		}
+	case topicKindSQS:
+		var entry *sqs.SendMessageBatchResultEntry
+		if !as(&entry) {
+			return fmt.Errorf("cast failed for %T", &entry)
+		}
+	default:
+		panic("unreachable")
+	}
+	return nil
+}
+
 func sanitize(s string) string {
 	// AWS doesn't like names that are too long; trim some not-so-useful stuff.
 	const maxNameLen = 80
@@ -456,6 +474,10 @@ func TestOpenSubscriptionFromURL(t *testing.T) {
 		{"awssqs://sqs.us-east-2.amazonaws.com/99999/my-queue?raw=1", false},
 		// Invalid raw.
 		{"awssqs://sqs.us-east-2.amazonaws.com/99999/my-queue?raw=foo", true},
+		// OK, setting waittime.
+		{"awssqs://sqs.us-east-2.amazonaws.com/99999/my-queue?waittime=5s", false},
+		// Invalid waittime.
+		{"awssqs://sqs.us-east-2.amazonaws.com/99999/my-queue?waittime=foo", true},
 		// Invalid parameter.
 		{"awssqs://sqs.us-east-2.amazonaws.com/99999/my-queue?param=value", true},
 	}

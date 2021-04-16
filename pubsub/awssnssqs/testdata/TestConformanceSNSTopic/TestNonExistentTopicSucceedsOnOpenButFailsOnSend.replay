@@ -1,7 +1,8 @@
 {
-  "Initial": "AQAAAA7U35IQDKff5f5c",
+  "Initial": "AQAAAA7XW2guLum9m/4g",
   "Version": "0.2",
   "Converter": {
+    "ScrubBody": null,
     "ClearHeaders": [
       "^X-Goog-.*Encryption-Key$",
       "^X-Amz-Date$",
@@ -40,7 +41,7 @@
   },
   "Entries": [
     {
-      "ID": "77ce5e93cc108028",
+      "ID": "16f3fbbc93c1ed28",
       "Request": {
         "Method": "POST",
         "URL": "https://sns.us-east-2.amazonaws.com/",
@@ -76,13 +77,13 @@
             "text/xml"
           ],
           "Date": [
-            "Fri, 09 Aug 2019 16:10:56 GMT"
+            "Thu, 03 Dec 2020 23:13:50 GMT"
           ],
           "X-Amzn-Requestid": [
-            "a7696529-0437-54a2-8ca3-30ee996796d3"
+            "5afecd7c-9687-52a9-8645-953fe5e8943f"
           ]
         },
-        "Body": "PEVycm9yUmVzcG9uc2UgeG1sbnM9Imh0dHA6Ly9zbnMuYW1hem9uYXdzLmNvbS9kb2MvMjAxMC0wMy0zMS8iPgogIDxFcnJvcj4KICAgIDxUeXBlPlNlbmRlcjwvVHlwZT4KICAgIDxDb2RlPk5vdEZvdW5kPC9Db2RlPgogICAgPE1lc3NhZ2U+VG9waWMgZG9lcyBub3QgZXhpc3Q8L01lc3NhZ2U+CiAgPC9FcnJvcj4KICA8UmVxdWVzdElkPmE3Njk2NTI5LTA0MzctNTRhMi04Y2EzLTMwZWU5OTY3OTZkMzwvUmVxdWVzdElkPgo8L0Vycm9yUmVzcG9uc2U+Cg=="
+        "Body": "PEVycm9yUmVzcG9uc2UgeG1sbnM9Imh0dHA6Ly9zbnMuYW1hem9uYXdzLmNvbS9kb2MvMjAxMC0wMy0zMS8iPgogIDxFcnJvcj4KICAgIDxUeXBlPlNlbmRlcjwvVHlwZT4KICAgIDxDb2RlPk5vdEZvdW5kPC9Db2RlPgogICAgPE1lc3NhZ2U+VG9waWMgZG9lcyBub3QgZXhpc3Q8L01lc3NhZ2U+CiAgPC9FcnJvcj4KICA8UmVxdWVzdElkPjVhZmVjZDdjLTk2ODctNTJhOS04NjQ1LTk1M2ZlNWU4OTQzZjwvUmVxdWVzdElkPgo8L0Vycm9yUmVzcG9uc2U+Cg=="
       }
     }
   ]

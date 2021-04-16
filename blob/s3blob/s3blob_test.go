@@ -70,6 +70,10 @@ func (h *harness) MakeDriver(ctx context.Context) (driver.Bucket, error) {
 	return openBucket(ctx, h.session, bucketName, h.opts)
 }
 
+func (h *harness) MakeDriverForNonexistentBucket(ctx context.Context) (driver.Bucket, error) {
+	return openBucket(ctx, h.session, "bucket-does-not-exist", h.opts)
+}
+
 func (h *harness) Close() {
 	h.closer()
 }
@@ -135,9 +139,13 @@ func (verifyContentLanguage) BeforeRead(as func(interface{}) bool) error {
 func (verifyContentLanguage) BeforeWrite(as func(interface{}) bool) error {
 	var req *s3manager.UploadInput
 	if !as(&req) {
-		return errors.New("Writer.As failed")
+		return errors.New("Writer.As failed for UploadInput")
 	}
 	req.ContentLanguage = aws.String(language)
+	var u *s3manager.Uploader
+	if !as(&u) {
+		return errors.New("Writer.As failed for Uploader")
+	}
 	return nil
 }
 
@@ -163,6 +171,18 @@ func (v verifyContentLanguage) BeforeList(as func(interface{}) bool) error {
 	}
 	// Nothing to do.
 	return nil
+}
+
+func (v verifyContentLanguage) BeforeSign(as func(interface{}) bool) error {
+	var (
+		get *s3.GetObjectInput
+		put *s3.PutObjectInput
+		del *s3.DeleteObjectInput
+	)
+	if as(&get) || as(&put) || as(&del) {
+		return nil
+	}
+	return errors.New("BeforeSign.As failed")
 }
 
 func (verifyContentLanguage) AttributesCheck(attrs *blob.Attributes) error {

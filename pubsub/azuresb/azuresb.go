@@ -48,8 +48,9 @@
 //  - Topic: *servicebus.Topic
 //  - Subscription: *servicebus.Subscription
 //  - Message.BeforeSend: *servicebus.Message
+//  - Message.AfterSend: None
 //  - Message: *servicebus.Message
-//  - Error: common.Retryable
+//  - Error: common.Retryable, *amqp.Error, *amqp.DetachError
 package azuresb // import "gocloud.dev/pubsub/azuresb"
 
 import (
@@ -59,35 +60,32 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
 
-	common "github.com/Azure/azure-amqp-common-go/v2"
-	"github.com/Azure/azure-amqp-common-go/v2/cbs"
-	"github.com/Azure/azure-amqp-common-go/v2/rpc"
-	"github.com/Azure/azure-amqp-common-go/v2/uuid"
+	common "github.com/Azure/azure-amqp-common-go/v3"
+	"github.com/Azure/azure-amqp-common-go/v3/uuid"
 	servicebus "github.com/Azure/azure-service-bus-go"
+	"github.com/Azure/go-amqp"
 	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/batcher"
-	"gocloud.dev/internal/useragent"
 	"gocloud.dev/pubsub"
+	"gocloud.dev/pubsub/batcher"
 	"gocloud.dev/pubsub/driver"
-	"pack.ag/amqp"
 )
 
 const (
-	// https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-amqp-request-response#update-disposition-status
-	dispositionForAck  = "completed"
-	dispositionForNack = "abandoned"
-
 	listenerTimeout = 1 * time.Second
 )
 
 var sendBatcherOpts = &batcher.Options{
 	MaxBatchSize: 1,   // SendBatch only supports one message at a time
 	MaxHandlers:  100, // max concurrency for sends
+}
+
+var recvBatcherOpts = &batcher.Options{
+	MaxBatchSize: 1,   // ReceiveBatch only returns one message at a time
+	MaxHandlers:  100, // max concurrency for reads
 }
 
 func init() {
@@ -279,12 +277,22 @@ func (t *topic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 			return err
 		}
 	}
-	return t.sbTopic.Send(ctx, sbms)
+	err := t.sbTopic.Send(ctx, sbms)
+	if err != nil {
+		return err
+	}
+	if dm.AfterSend != nil {
+		asFunc := func(i interface{}) bool { return false }
+		if err := dm.AfterSend(asFunc); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *topic) IsRetryable(err error) bool {
-	// Let the Service Bus SDK recover from any transient connectivity issue.
-	return false
+	_, retryable := errorCode(err)
+	return retryable
 }
 
 func (t *topic) As(i interface{}) bool {
@@ -303,6 +311,11 @@ func (*topic) ErrorAs(err error, i interface{}) bool {
 
 func errorAs(err error, i interface{}) bool {
 	switch v := err.(type) {
+	case *amqp.DetachError:
+		if p, ok := i.(**amqp.DetachError); ok {
+			*p = v
+			return true
+		}
 	case *amqp.Error:
 		if p, ok := i.(**amqp.Error); ok {
 			*p = v
@@ -318,7 +331,8 @@ func errorAs(err error, i interface{}) bool {
 }
 
 func (*topic) ErrorCode(err error) gcerrors.ErrorCode {
-	return errorCode(err)
+	code, _ := errorCode(err)
+	return code
 }
 
 // Close implements driver.Topic.Close.
@@ -327,9 +341,6 @@ func (*topic) Close() error { return nil }
 type subscription struct {
 	sbSub *servicebus.Subscription
 	opts  *SubscriptionOptions
-
-	linkErr  error     // saved error for initializing amqpLink
-	amqpLink *rpc.Link // nil if linkErr != nil
 }
 
 // SubscriptionOptions will contain configuration for subscriptions.
@@ -347,7 +358,7 @@ func OpenSubscription(ctx context.Context, parentNamespace *servicebus.Namespace
 	if err != nil {
 		return nil, err
 	}
-	return pubsub.NewSubscription(ds, nil, nil), nil
+	return pubsub.NewSubscription(ds, recvBatcherOpts, nil), nil
 }
 
 // openSubscription returns a driver.Subscription.
@@ -364,43 +375,13 @@ func openSubscription(ctx context.Context, sbNs *servicebus.Namespace, sbTop *se
 	if opts == nil {
 		opts = &SubscriptionOptions{}
 	}
-	sub := &subscription{sbSub: sbSub, opts: opts}
-
-	// Initialize a link to the AMQP server, but save any errors to be
-	// returned in ReceiveBatch instead of returning them here, because we
-	// want "subscription not found" to be a Receive time error.
-	host := fmt.Sprintf("amqps://%s.%s/", sbNs.Name, sbNs.Environment.ServiceBusEndpointSuffix)
-	amqpClient, err := amqp.Dial(host,
-		amqp.ConnSASLAnonymous(),
-		amqp.ConnProperty("product", "Go-Cloud Client"),
-		amqp.ConnProperty("version", servicebus.Version),
-		amqp.ConnProperty("platform", runtime.GOOS),
-		amqp.ConnProperty("framework", runtime.Version()),
-		amqp.ConnProperty("user-agent", useragent.AzureUserAgentPrefix("pubsub")),
-	)
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to dial AMQP: %v", err)
-		return sub, nil
-	}
-	entityPath := sbTop.Name + "/Subscriptions/" + sbSub.Name
-	audience := host + entityPath
-	if err = cbs.NegotiateClaim(ctx, audience, amqpClient, sbNs.TokenProvider); err != nil {
-		sub.linkErr = fmt.Errorf("failed to negotiate claim with AMQP: %v", err)
-		return sub, nil
-	}
-	link, err := rpc.NewLink(amqpClient, sbSub.ManagementPath())
-	if err != nil {
-		sub.linkErr = fmt.Errorf("failed to create link to AMQP %s: %v", sbSub.ManagementPath(), err)
-		return sub, nil
-	}
-	sub.amqpLink = link
-	return sub, nil
+	return &subscription{sbSub: sbSub, opts: opts}, nil
 }
 
 // IsRetryable implements driver.Subscription.IsRetryable.
-func (s *subscription) IsRetryable(error) bool {
-	// Let the Service Bus SDK recover from any transient connectivity issue.
-	return false
+func (s *subscription) IsRetryable(err error) bool {
+	_, retryable := errorCode(err)
+	return retryable
 }
 
 // As implements driver.Subscription.As.
@@ -419,60 +400,43 @@ func (s *subscription) ErrorAs(err error, i interface{}) bool {
 }
 
 func (s *subscription) ErrorCode(err error) gcerrors.ErrorCode {
-	return errorCode(err)
-}
-
-// partitionAckID is used as the driver.AckID.
-//
-// We use a batch API to ack/nack messages via the LockToken, but AzureSB
-// doesn't support updating messages from different partitions in the same
-// request. We store the PartitionID (which will default to 0 if partitioning
-// isn't enabled) along with the LockToken so that we can group by it during
-// Ack/Nack.
-type partitionAckID struct {
-	PartitionID int16
-	LockToken   *uuid.UUID
+	code, _ := errorCode(err)
+	return code
 }
 
 // ReceiveBatch implements driver.Subscription.ReceiveBatch.
 func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*driver.Message, error) {
-	if s.linkErr != nil {
-		return nil, s.linkErr
-	}
-
+	// ReceiveOne will block until rctx is Done; we want to return after
+	// a reasonably short delay even if there are no messages. So, create a
+	// sub context for the RPC.
 	rctx, cancel := context.WithTimeout(ctx, listenerTimeout)
 	defer cancel()
-	var messages []*driver.Message
 
-	// Loop until rctx is Done, or until we've received maxMessages.
-	for len(messages) < maxMessages && rctx.Err() == nil {
-		// NOTE: there's also a Receive method, but it starts two goroutines
-		// that aren't necessarily finished when Receive returns, which causes
-		// data races if Receive is called again quickly. ReceiveOne is more
-		// straightforward.
-		_ = s.sbSub.ReceiveOne(rctx, servicebus.HandlerFunc(func(_ context.Context, sbmsg *servicebus.Message) error {
-			metadata := map[string]string{}
-			for key, value := range sbmsg.GetKeyValues() {
-				if strVal, ok := value.(string); ok {
-					metadata[key] = strVal
-				}
+	// NOTE: there's also a Receive method, but it starts two goroutines
+	// that aren't necessarily finished when Receive returns, which causes
+	// data races if Receive is called again quickly. ReceiveOne is more
+	// straightforward.
+	var messages []*driver.Message
+	err := s.sbSub.ReceiveOne(rctx, servicebus.HandlerFunc(func(_ context.Context, sbmsg *servicebus.Message) error {
+		metadata := map[string]string{}
+		for key, value := range sbmsg.GetKeyValues() {
+			if strVal, ok := value.(string); ok {
+				metadata[key] = strVal
 			}
-			// partitionID is only available if partitioning is enabled; otherwise,
-			// it defaults to 0.
-			var partitionID int16
-			if sbmsg.SystemProperties != nil && sbmsg.SystemProperties.PartitionID != nil {
-				partitionID = *sbmsg.SystemProperties.PartitionID
-			}
-			messages = append(messages, &driver.Message{
-				Body:     sbmsg.Data,
-				Metadata: metadata,
-				AckID:    &partitionAckID{partitionID, sbmsg.LockToken},
-				AsFunc:   messageAsFunc(sbmsg),
-			})
-			return nil
-		}))
+		}
+		messages = append(messages, &driver.Message{
+			Body:     sbmsg.Data,
+			Metadata: metadata,
+			AckID:    sbmsg.LockToken,
+			AsFunc:   messageAsFunc(sbmsg),
+		})
+		return nil
+	}))
+	// Mask rctx timeouts, they are expected if no messages are available.
+	if err == rctx.Err() {
+		err = nil
 	}
-	return messages, nil
+	return messages, err
 }
 
 func messageAsFunc(sbmsg *servicebus.Message) func(interface{}) bool {
@@ -492,7 +456,7 @@ func (s *subscription) SendAcks(ctx context.Context, ids []driver.AckID) error {
 		// Ack is a no-op in Receive-and-Delete mode.
 		return nil
 	}
-	return s.updateMessageDispositions(ctx, ids, dispositionForAck)
+	return s.updateMessageDispositions(ctx, ids, servicebus.Complete)
 }
 
 // CanNack implements driver.CanNack.
@@ -508,87 +472,46 @@ func (s *subscription) SendNacks(ctx context.Context, ids []driver.AckID) error 
 	if !s.CanNack() {
 		panic("unreachable")
 	}
-	return s.updateMessageDispositions(ctx, ids, dispositionForNack)
+	return s.updateMessageDispositions(ctx, ids, servicebus.Abort)
 }
 
-// IMPORTANT: This is a workaround to issue message dispositions in bulk which is not supported in the Service Bus SDK.
-func (s *subscription) updateMessageDispositions(ctx context.Context, ids []driver.AckID, disposition string) error {
+func (s *subscription) updateMessageDispositions(ctx context.Context, ids []driver.AckID, status servicebus.MessageStatus) error {
 	if len(ids) == 0 {
 		return nil
 	}
-
-	// Group by partitionID; AzureSB doesn't support updating dispositions for
-	// messages from different partitions.
-	partitions := map[int16][]amqp.UUID{}
+	var lockTokenIDs []*uuid.UUID
 	for _, ackID := range ids {
-		if pid, ok := ackID.(*partitionAckID); ok {
-			lockTokenBytes := [16]byte(*pid.LockToken)
-			partitions[pid.PartitionID] = append(partitions[pid.PartitionID], amqp.UUID(lockTokenBytes))
+		if uid, ok := ackID.(*uuid.UUID); ok {
+			lockTokenIDs = append(lockTokenIDs, uid)
 		}
 	}
-
-	// Update partitions in parallel.
-	const maxConcurrency = 5
-	sem := make(chan struct{}, maxConcurrency)
-	var mu sync.Mutex
-	var errs []string
-	for _, lockTokens := range partitions {
-		sem <- struct{}{}
-		go func(lockTokens []amqp.UUID) {
-			defer func() { <-sem }() // Release the semaphore.
-			if err := s.updateMessageDispositionsInPartition(ctx, lockTokens, disposition); err != nil {
-				mu.Lock()
-				defer mu.Unlock()
-				errs = append(errs, err.Error())
-			}
-		}(lockTokens)
-	}
-	for n := 0; n < maxConcurrency; n++ {
-		sem <- struct{}{}
-	}
-	if len(errs) == 0 {
-		return nil
-	}
-	return fmt.Errorf("Ack/Nack failed: %s", strings.Join(errs, ", "))
-}
-
-// updateMessageDispositionsInPartition assumes lockTokens are all from the
-// same AzureSB partition.
-func (s *subscription) updateMessageDispositionsInPartition(ctx context.Context, lockTokens []amqp.UUID, disposition string) error {
-	value := map[string]interface{}{
-		"disposition-status": disposition,
-		"lock-tokens":        lockTokens,
-	}
-	msg := &amqp.Message{
-		ApplicationProperties: map[string]interface{}{
-			"operation": "com.microsoft:update-disposition",
-		},
-		Value: value,
-	}
-
-	// We're not actually making use of link.Retryable since we're passing 1
-	// here. The portable type will retry as needed.
-	//
-	// We could just use link.RPC, but it returns a result with a status code
-	// in addition to err, and we'd have to check both.
-	_, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg)
+	err := s.sbSub.SendBatchDisposition(ctx, servicebus.BatchDispositionIterator{
+		LockTokenIDs: lockTokenIDs,
+		Status:       status,
+	})
+	// The error returned from SendBatchDisposition is confusing. It always returns a non-nil
+	// *BatchDispositionError, which holds a list of LockTokenIDs that had errors,
+	// which might be empty (indicating no error).
 	if err == nil {
+		// Unexpected, but clearly no error.
 		return nil
 	}
-	if !isNotFoundErr(err) {
+	bderr, ok := err.(*servicebus.BatchDispositionError)
+	if !ok {
+		// Unexpected, some other kind of error; just return it.
 		return err
 	}
-	// It's a "not found" error, probably due to the message already being
-	// deleted on the server. If we're just acking 1 message, we can just
-	// swallow the error, but otherwise we'll need to retry one by one.
-	if len(lockTokens) == 1 {
+	if bderr == nil || len(bderr.Errors) == 0 {
+		// No actual errors.
 		return nil
 	}
-	for _, lockToken := range lockTokens {
-		value["lock-tokens"] = []amqp.UUID{lockToken}
-		if _, err := s.amqpLink.RetryableRPC(ctx, 1, 0, msg); err != nil && !isNotFoundErr(err) {
-			return err
+	// Ignore "not found" errors, as they are likely re-acks. Return the
+	// first other error (if any).
+	for _, err := range bderr.Errors {
+		if isNotFoundErr(err) {
+			continue
 		}
+		return err
 	}
 	return nil
 }
@@ -599,42 +522,47 @@ func isNotFoundErr(err error) bool {
 	return strings.Contains(err.Error(), "status code 410")
 }
 
-func errorCode(err error) gcerrors.ErrorCode {
+// errorCode returns an error code and whether err is retryable.
+func errorCode(err error) (gcerrors.ErrorCode, bool) {
 	// Unfortunately Azure sometimes returns common.Retryable or even
 	// errors.errorString, which don't expose anything other than the error
 	// string :-(.
 	if strings.Contains(err.Error(), "status code 404") {
-		return gcerrors.NotFound
+		return gcerrors.NotFound, false
 	}
-	aerr, ok := err.(*amqp.Error)
-	if !ok {
-		return gcerrors.Unknown
+	var cond amqp.ErrorCondition
+	if aerr, ok := err.(*amqp.DetachError); ok {
+		if aerr.RemoteError == nil {
+			return gcerrors.NotFound, false
+		}
+		cond = aerr.RemoteError.Condition
 	}
-	switch aerr.Condition {
+	if aerr, ok := err.(*amqp.Error); ok {
+		cond = aerr.Condition
+	}
+	switch cond {
 	case amqp.ErrorCondition(servicebus.ErrorNotFound):
-		return gcerrors.NotFound
+		return gcerrors.NotFound, false
 
 	case amqp.ErrorCondition(servicebus.ErrorPreconditionFailed):
-		return gcerrors.FailedPrecondition
+		return gcerrors.FailedPrecondition, false
 
 	case amqp.ErrorCondition(servicebus.ErrorInternalError):
-		return gcerrors.Internal
+		return gcerrors.Internal, true
 
 	case amqp.ErrorCondition(servicebus.ErrorNotImplemented):
-		return gcerrors.Unimplemented
+		return gcerrors.Unimplemented, false
 
 	case amqp.ErrorCondition(servicebus.ErrorUnauthorizedAccess), amqp.ErrorCondition(servicebus.ErrorNotAllowed):
-		return gcerrors.PermissionDenied
+		return gcerrors.PermissionDenied, false
 
 	case amqp.ErrorCondition(servicebus.ErrorResourceLimitExceeded):
-		return gcerrors.ResourceExhausted
+		return gcerrors.ResourceExhausted, true
 
 	case amqp.ErrorCondition(servicebus.ErrorInvalidField):
-		return gcerrors.InvalidArgument
-
-	default:
-		return gcerrors.Unknown
+		return gcerrors.InvalidArgument, false
 	}
+	return gcerrors.Unknown, true
 }
 
 // Close implements driver.Subscription.Close.

@@ -44,6 +44,7 @@
 //  - Topic: *raw.PublisherClient
 //  - Subscription: *raw.SubscriberClient
 //  - Message.BeforeSend: *pb.PubsubMessage
+//  - Message.AfterSend: *string for the pb.PublishResponse.MessageIds entry corresponding to the message.
 //  - Message: *pb.PubsubMessage
 //  - Error: *google.golang.org/grpc/status.Status
 package gcppubsub // import "gocloud.dev/pubsub/gcppubsub"
@@ -63,10 +64,10 @@ import (
 	"github.com/google/wire"
 	"gocloud.dev/gcerrors"
 	"gocloud.dev/gcp"
-	"gocloud.dev/internal/batcher"
 	"gocloud.dev/internal/gcerr"
 	"gocloud.dev/internal/useragent"
 	"gocloud.dev/pubsub"
+	"gocloud.dev/pubsub/batcher"
 	"gocloud.dev/pubsub/driver"
 	"google.golang.org/api/option"
 	pb "google.golang.org/genproto/googleapis/pubsub/v1"
@@ -122,24 +123,30 @@ type lazyCredsOpener struct {
 
 func (o *lazyCredsOpener) defaultConn(ctx context.Context) (*URLOpener, error) {
 	o.init.Do(func() {
-		creds, err := gcp.DefaultCredentials(ctx)
-		if err != nil {
-			o.err = err
-			return
-		}
+		var conn *grpc.ClientConn
+		var err error
+		if e := os.Getenv("PUBSUB_EMULATOR_HOST"); e != "" {
+			// Connect to the GCP pubsub emulator by overriding the default endpoint
+			// if the 'PUBSUB_EMULATOR_HOST' environment variable is set.
+			// Check https://cloud.google.com/pubsub/docs/emulator for more info.
+			endPoint = e
+			conn, err = dialEmulator(ctx, e)
+			if err != nil {
+				o.err = err
+				return
+			}
+		} else {
+			creds, err := gcp.DefaultCredentials(ctx)
+			if err != nil {
+				o.err = err
+				return
+			}
 
-		// Connect to the GCP pubsub emulator by overriding the default endpoint
-		// if the 'PUBSUB_EMULATOR_HOST' environment variable is set.
-		// Check https://cloud.google.com/pubsub/docs/emulator for more info.
-		emulatorEndPoint := os.Getenv("PUBSUB_EMULATOR_HOST")
-		if emulatorEndPoint != "" {
-			endPoint = emulatorEndPoint
-		}
-
-		conn, _, err := Dial(ctx, creds.TokenSource)
-		if err != nil {
-			o.err = err
-			return
+			conn, _, err = Dial(ctx, creds.TokenSource)
+			if err != nil {
+				o.err = err
+				return
+			}
 		}
 		o.opener = &URLOpener{Conn: conn}
 	})
@@ -232,12 +239,27 @@ func Dial(ctx context.Context, ts gcp.TokenSource) (*grpc.ClientConn, func(), er
 	conn, err := grpc.DialContext(ctx, endPoint,
 		grpc.WithTransportCredentials(credentials.NewClientTLSFromCert(nil, "")),
 		grpc.WithPerRPCCredentials(oauth.TokenSource{TokenSource: ts}),
+		// The default message size limit for gRPC is 4MB, while GCP
+		// PubSub supports messages up to 10MB. Tell gRPC to support up
+		// to 10MB.
+		// https://github.com/googleapis/google-cloud-node/issues/1991
+		grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(1024*1024*10)),
 		useragent.GRPCDialOption("pubsub"),
 	)
+
 	if err != nil {
 		return nil, nil, err
 	}
 	return conn, func() { conn.Close() }, nil
+}
+
+// dialEmulator opens a gRPC connection to the GCP Pub Sub API.
+func dialEmulator(ctx context.Context, e string) (*grpc.ClientConn, error) {
+	conn, err := grpc.DialContext(ctx, e, grpc.WithInsecure(), useragent.GRPCDialOption("pubsub"))
+	if err != nil {
+		return nil, err
+	}
+	return conn, nil
 }
 
 // PublisherClient returns a *raw.PublisherClient that can be used in OpenTopic.
@@ -300,8 +322,25 @@ func (t *topic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 		ms = append(ms, psm)
 	}
 	req := &pb.PublishRequest{Topic: t.path, Messages: ms}
-	if _, err := t.client.Publish(ctx, req); err != nil {
+	pr, err := t.client.Publish(ctx, req)
+	if err != nil {
 		return err
+	}
+	if len(pr.MessageIds) == len(dms) {
+		for n, dm := range dms {
+			if dm.AfterSend != nil {
+				asFunc := func(i interface{}) bool {
+					if p, ok := i.(*string); ok {
+						*p = pr.MessageIds[n]
+						return true
+					}
+					return false
+				}
+				if err := dm.AfterSend(asFunc); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }

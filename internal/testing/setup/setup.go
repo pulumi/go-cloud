@@ -220,8 +220,12 @@ func NewAzureTestPipeline(ctx context.Context, t *testing.T, api string, credent
 	client, done, _ := NewRecordReplayClient(ctx, t, func(r *httpreplay.Recorder) {
 		r.RemoveQueryParams("se", "sig")
 		r.RemoveQueryParams("X-Ms-Date")
+		r.ClearQueryParams("blockid")
 		r.ClearHeaders("X-Ms-Date")
 		r.ClearHeaders("User-Agent") // includes the full Go version
+		// Yes, it's true, Azure does not appear to be internally
+		// consistent about casing for BLock(l|L)ist.
+		r.ScrubBody("<Block(l|L)ist><Latest>.*</Latest></Block(l|L)ist>")
 	})
 	f := []pipeline.Factory{
 		// Sets User-Agent for recorder.
@@ -285,6 +289,7 @@ func FakeGCPDefaultCredentials(t *testing.T) func() {
 // RPCs to the file at filename, or read the RPCs from the file and return them.
 func newGCPRecordDialOptions(t *testing.T, filename string) (opts []grpc.DialOption, done func()) {
 	path := filepath.Join("testdata", filename)
+	os.MkdirAll(filepath.Dir(path), os.ModePerm)
 	t.Logf("Recording into golden file %s", path)
 	r, err := grpcreplay.NewRecorder(path, nil)
 	if err != nil {

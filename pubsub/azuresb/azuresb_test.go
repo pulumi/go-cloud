@@ -26,7 +26,7 @@ import (
 	"gocloud.dev/pubsub/driver"
 	"gocloud.dev/pubsub/drivertest"
 
-	common "github.com/Azure/azure-amqp-common-go/v2"
+	common "github.com/Azure/azure-amqp-common-go/v3"
 	servicebus "github.com/Azure/azure-service-bus-go"
 )
 
@@ -136,10 +136,18 @@ func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testN
 	return ds, cleanup, nil
 }
 
-func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, error) {
-	sbTopic, _ := NewTopic(h.ns, nonexistentTopicName, nil)
-	sbSub, _ := NewSubscription(sbTopic, "nonexistent-subscription", nil)
-	return openSubscription(ctx, h.ns, sbTopic, sbSub, nil)
+func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, func(), error) {
+	dt, cleanup, err := h.CreateTopic(ctx, "topic-for-nonexistent-sub")
+	if err != nil {
+		return nil, nil, err
+	}
+	sbTopic := dt.(*topic).sbTopic
+	sbSub, err := NewSubscription(sbTopic, "nonexistent-subscription", nil)
+	if err != nil {
+		return nil, cleanup, err
+	}
+	sub, err := openSubscription(ctx, h.ns, sbTopic, sbSub, nil)
+	return sub, cleanup, err
 }
 
 func (h *harness) Close() {
@@ -229,6 +237,10 @@ func (sbAsTest) BeforeSend(as func(interface{}) bool) error {
 	if !as(&m) {
 		return fmt.Errorf("cast failed for %T", &m)
 	}
+	return nil
+}
+
+func (sbAsTest) AfterSend(as func(interface{}) bool) error {
 	return nil
 }
 

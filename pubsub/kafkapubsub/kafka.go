@@ -48,6 +48,7 @@
 //  - Subscription: sarama.ConsumerGroup, sarama.ConsumerGroupSession (may be nil during session renegotiation, and session may go stale at any time)
 //  - Message: *sarama.ConsumerMessage
 //  - Message.BeforeSend: *sarama.ProducerMessage
+//  - Message.AfterSend: None
 //  - Error: sarama.ConsumerError, sarama.ConsumerErrors, sarama.ProducerError, sarama.ProducerErrors, sarama.ConfigurationError, sarama.PacketDecodingError, sarama.PacketEncodingError, sarama.KError
 package kafkapubsub // import "gocloud.dev/pubsub/kafkapubsub"
 
@@ -65,9 +66,8 @@ import (
 
 	"github.com/Shopify/sarama"
 	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/batcher"
-	"gocloud.dev/internal/gcerr"
 	"gocloud.dev/pubsub"
+	"gocloud.dev/pubsub/batcher"
 	"gocloud.dev/pubsub/driver"
 )
 
@@ -230,20 +230,20 @@ func (t *topic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 	// Convert the messages to a slice of sarama.ProducerMessage.
 	ms := make([]*sarama.ProducerMessage, 0, len(dms))
 	for _, dm := range dms {
-		var kafkaKey []byte
+		var kafkaKey sarama.Encoder
 		var headers []sarama.RecordHeader
 		for k, v := range dm.Metadata {
 			if k == t.opts.KeyName {
 				// Use this key's value as the Kafka message key instead of adding it
 				// to the headers.
-				kafkaKey = []byte(v)
+				kafkaKey = sarama.ByteEncoder(v)
 			} else {
 				headers = append(headers, sarama.RecordHeader{Key: []byte(k), Value: []byte(v)})
 			}
 		}
 		pm := &sarama.ProducerMessage{
 			Topic:   t.topicName,
-			Key:     sarama.ByteEncoder(kafkaKey),
+			Key:     kafkaKey,
 			Value:   sarama.ByteEncoder(dm.Body),
 			Headers: headers,
 		}
@@ -262,7 +262,19 @@ func (t *topic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 		ms = append(ms, pm)
 
 	}
-	return t.producer.SendMessages(ms)
+	err := t.producer.SendMessages(ms)
+	if err != nil {
+		return err
+	}
+	for _, dm := range dms {
+		if dm.AfterSend != nil {
+			asFunc := func(i interface{}) bool { return false }
+			if err := dm.AfterSend(asFunc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Close implements io.Closer.
@@ -302,9 +314,9 @@ func errorCode(err error) gcerrors.ErrorCode {
 		return errorCode(pe.Err)
 	}
 	if err == sarama.ErrUnknownTopicOrPartition {
-		return gcerr.NotFound
+		return gcerrors.NotFound
 	}
-	return gcerr.Unknown
+	return gcerrors.Unknown
 }
 
 type subscription struct {

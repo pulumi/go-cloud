@@ -62,6 +62,16 @@ type Message struct {
 	// asFunc converts its argument to driver-specific types.
 	// See https://gocloud.dev/concepts/as/ for background information.
 	BeforeSend func(asFunc func(interface{}) bool) error
+
+	// AfterSend is a callback used when sending a message. It should remain
+	// nil on messages returned from ReceiveBatch.
+	//
+	// The callback must be called at most once, after the message is sent.
+	// If Send returns an error, AfterSend will not be called.
+	//
+	// asFunc converts its argument to driver-specific types.
+	// See https://gocloud.dev/concepts/as/ for background information.
+	AfterSend func(asFunc func(interface{}) bool) error
 }
 
 // Topic publishes messages.
@@ -125,7 +135,8 @@ type Subscription interface {
 	// should return a nil slice and an error. The concrete API will take
 	// care of retry logic.
 	//
-	// If no messages are currently available, this method can return an empty
+	// If no messages are currently available, this method should block for
+	// no more than about 1 second. It can return an empty
 	// slice of messages and no error. ReceiveBatch will be called again
 	// immediately, so implementations should try to wait for messages for some
 	// non-zero amount of time before returning zero messages. If the underlying
@@ -146,6 +157,8 @@ type Subscription interface {
 	//
 	// It is acceptable for SendAcks to be a no-op for drivers that don't
 	// support message acknowledgement.
+	//
+	// Drivers should suppress errors caused by double-acking a message.
 	//
 	// SendAcks may be called concurrently from multiple goroutines.
 	//

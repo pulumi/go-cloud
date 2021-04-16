@@ -95,8 +95,8 @@ func (h *harness) CreateQueueSubscription(ctx context.Context, dt driver.Topic, 
 	return ds, cleanup, nil
 }
 
-func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, error) {
-	return (*subscription)(nil), nil
+func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, func(), error) {
+	return (*subscription)(nil), func() {}, nil
 }
 
 func (h *harness) Close() {
@@ -167,6 +167,10 @@ func (natsAsTest) MessageCheck(m *pubsub.Message) error {
 }
 
 func (natsAsTest) BeforeSend(as func(interface{}) bool) error {
+	return nil
+}
+
+func (natsAsTest) AfterSend(as func(interface{}) bool) error {
 	return nil
 }
 

@@ -55,13 +55,14 @@
 // azureblob exposes the following types for As:
 //  - Bucket: *azblob.ContainerURL
 //  - Error: azblob.StorageError
-//  - ListObject: azblob.BlobItem for objects, azblob.BlobPrefix for "directories"
+//  - ListObject: azblob.BlobItemInternal for objects, azblob.BlobPrefix for "directories"
 //  - ListOptions.BeforeList: *azblob.ListBlobsSegmentOptions
 //  - Reader: azblob.DownloadResponse
 //  - Reader.BeforeRead: *azblob.BlockBlobURL, *azblob.BlobAccessConditions
 //  - Attributes: azblob.BlobGetPropertiesResponse
 //  - CopyOptions.BeforeCopy: azblob.Metadata, *azblob.ModifiedAccessConditions, *azblob.BlobAccessConditions
 //  - WriterOptions.BeforeWrite: *azblob.UploadStreamToBlockBlobOptions
+//  - SignedURLOptions.BeforeSign: *azblob.BlobSASSignatureValues
 package azureblob
 
 import (
@@ -80,6 +81,8 @@ import (
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/go-autorest/autorest/adal"
+	"github.com/Azure/go-autorest/autorest/azure"
 	"github.com/google/uuid"
 	"github.com/google/wire"
 	"gocloud.dev/blob"
@@ -91,10 +94,15 @@ import (
 	"gocloud.dev/internal/useragent"
 )
 
+const (
+	tokenRefreshTolerance = 300
+)
+
 // Options sets options for constructing a *blob.Bucket backed by Azure Block Blob.
 type Options struct {
 	// Credential represents the authorizer for SignedURL.
-	// Required to use SignedURL.
+	// Required to use SignedURL. If you're using MSI for authentication, this will
+	// attempt to be loaded lazily the first time you call SignedURL.
 	Credential azblob.StorageAccountCredential
 
 	// SASToken can be provided along with anonymous credentials to use
@@ -107,7 +115,22 @@ type Options struct {
 	// The default value is "blob.core.windows.net". Possible values will look similar
 	// to this but are different for each cloud (i.e. "blob.core.govcloudapi.net" for USGovernment).
 	// Check the Azure developer guide for the cloud environment where your bucket resides.
+	// The full URL used is "<Protocol>://<account name>.<StorageDomain>", where the
+	// "<account name>." part is dropped if IsCDN is set to true.
 	StorageDomain StorageDomain
+
+	// Protocol can be provided to specify protocol to access Azure Blob Storage.
+	// Protocols that can be specified are "http" for local emulator and "https" for general.
+	// If blank is specified, "https" will be used.
+	// The full URL used is "<Protocol>://<account name>.<StorageDomain>", where the
+	// "<account name>." part is dropped if IsCDN is set to true.
+	Protocol Protocol
+
+	// IsCDN can be set to true when using a CDN URL pointing to a blob storage account:
+	// https://docs.microsoft.com/en-us/azure/cdn/cdn-create-a-storage-account-with-cdn
+	// The full URL used is "<Protocol>://<account name>.<StorageDomain>", where the
+	// "<account name>." part is dropped if IsCDN is set to true.
+	IsCDN bool
 }
 
 const (
@@ -144,7 +167,23 @@ func (o *lazyCredsOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.
 		accountKey, _ := DefaultAccountKey()
 		sasToken, _ := DefaultSASToken()
 		storageDomain, _ := DefaultStorageDomain()
-		o.opener, o.err = openerFromEnv(accountName, accountKey, sasToken, storageDomain)
+		isCDN, _ := DefaultIsCDN()
+		protocol, _ := DefaultProtocol()
+
+		isMSIEnvironment := adal.MSIAvailable(ctx, adal.CreateSender())
+		opts := Options{
+			StorageDomain: storageDomain,
+			Protocol:      protocol,
+			IsCDN:         isCDN,
+		}
+
+		if accountKey != "" || sasToken != "" {
+			o.opener, o.err = openerFromEnv(accountName, accountKey, sasToken, opts)
+		} else if isMSIEnvironment {
+			o.opener, o.err = openerFromMSI(accountName, opts)
+		} else {
+			o.opener, o.err = openerFromAnon(accountName, opts)
+		}
 	})
 	if o.err != nil {
 		return nil, fmt.Errorf("open bucket %v: %v", u, o.err)
@@ -160,7 +199,12 @@ const Scheme = "azblob"
 //
 // The URL host is used as the bucket name.
 //
-// No query parameters are supported.
+// The following query options are supported:
+//  - domain: The domain name used to access the Azure Blob storage (e.g. blob.core.windows.net)
+//  - protocol: The protocol to use (e.g., http or https; default to https)
+//  - cdn: Set to true when domain represents a CDN
+//
+// See Options for more details.
 type URLOpener struct {
 	// AccountName must be specified.
 	AccountName AccountName
@@ -172,7 +216,7 @@ type URLOpener struct {
 	Options Options
 }
 
-func openerFromEnv(accountName AccountName, accountKey AccountKey, sasToken SASToken, storageDomain StorageDomain) (*URLOpener, error) {
+func openerFromEnv(accountName AccountName, accountKey AccountKey, sasToken SASToken, opts Options) (*URLOpener, error) {
 	// azblob.Credential is an interface; we will use either a SharedKeyCredential
 	// or anonymous credentials. If the former, we will also fill in
 	// Options.Credential so that SignedURL will work.
@@ -188,23 +232,113 @@ func openerFromEnv(accountName AccountName, accountKey AccountKey, sasToken SAST
 	} else {
 		credential = azblob.NewAnonymousCredential()
 	}
+	opts.Credential = storageAccountCredential
+	opts.SASToken = sasToken
 	return &URLOpener{
 		AccountName: accountName,
 		Pipeline:    NewPipeline(credential, azblob.PipelineOptions{}),
-		Options: Options{
-			Credential:    storageAccountCredential,
-			SASToken:      sasToken,
-			StorageDomain: storageDomain,
-		},
+		Options:     opts,
 	}, nil
+}
+
+// openerFromAnon creates an anonymous credential backend URLOpener
+func openerFromAnon(accountName AccountName, opts Options) (*URLOpener, error) {
+	return &URLOpener{
+		AccountName: accountName,
+		Pipeline:    NewPipeline(azblob.NewAnonymousCredential(), azblob.PipelineOptions{}),
+		Options:     opts,
+	}, nil
+}
+
+var defaultTokenRefreshFunction = func(spToken *adal.ServicePrincipalToken) func(credential azblob.TokenCredential) time.Duration {
+	return func(credential azblob.TokenCredential) time.Duration {
+		err := spToken.Refresh()
+		if err != nil {
+			return 0
+		}
+		expiresIn, err := strconv.ParseInt(string(spToken.Token().ExpiresIn), 10, 64)
+		if err != nil {
+			return 0
+		}
+		credential.SetToken(spToken.Token().AccessToken)
+		return time.Duration(expiresIn-tokenRefreshTolerance) * time.Second
+	}
+}
+
+// openerFromMSI acquires an MSI token and returns TokenCredential backed URLOpener
+func openerFromMSI(accountName AccountName, opts Options) (*URLOpener, error) {
+
+	spToken, err := getMSIServicePrincipalToken(azure.PublicCloud.ResourceIdentifiers.Storage)
+	if err != nil {
+		return nil, fmt.Errorf("failure acquiring token from MSI endpoint %w", err)
+	}
+
+	err = spToken.Refresh()
+	if err != nil {
+		return nil, fmt.Errorf("failure refreshing token from MSI endpoint %w", err)
+	}
+
+	credential := azblob.NewTokenCredential(spToken.Token().AccessToken, defaultTokenRefreshFunction(spToken))
+	return &URLOpener{
+		AccountName: accountName,
+		Pipeline:    NewPipeline(credential, azblob.PipelineOptions{}),
+		Options:     opts,
+	}, nil
+}
+
+// getMSIServicePrincipalToken retrieves Azure API Service Principal token.
+func getMSIServicePrincipalToken(resource string) (*adal.ServicePrincipalToken, error) {
+
+	msiEndpoint, err := adal.GetMSIEndpoint()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get the managed service identity endpoint: %v", err)
+	}
+
+	token, err := adal.NewServicePrincipalTokenFromMSI(msiEndpoint, resource)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create the managed service identity token: %v", err)
+	}
+	return token, nil
+
 }
 
 // OpenBucketURL opens a blob.Bucket based on u.
 func (o *URLOpener) OpenBucketURL(ctx context.Context, u *url.URL) (*blob.Bucket, error) {
-	for k := range u.Query() {
-		return nil, fmt.Errorf("open bucket %v: invalid query parameter %q", u, k)
+	opts := new(Options)
+	*opts = o.Options
+
+	err := setOptionsFromURLParams(u.Query(), opts)
+	if err != nil {
+		return nil, err
 	}
-	return OpenBucket(ctx, o.Pipeline, o.AccountName, u.Host, &o.Options)
+
+	return OpenBucket(ctx, o.Pipeline, o.AccountName, u.Host, opts)
+}
+
+func setOptionsFromURLParams(q url.Values, o *Options) error {
+	for param, values := range q {
+		if len(values) > 1 {
+			return fmt.Errorf("multiple values of %v not allowed", param)
+		}
+
+		value := values[0]
+		switch param {
+		case "domain":
+			o.StorageDomain = StorageDomain(value)
+		case "protocol":
+			o.Protocol = Protocol(value)
+		case "cdn":
+			isCDN, err := strconv.ParseBool(value)
+			if err != nil {
+				return err
+			}
+			o.IsCDN = isCDN
+		default:
+			return fmt.Errorf("unknown query parameter %q", param)
+		}
+	}
+
+	return nil
 }
 
 // DefaultIdentity is a Wire provider set that provides an Azure storage
@@ -240,6 +374,11 @@ type SASToken string
 // (i.e. blob.core.windows.net, blob.core.govcloudapi.net, blob.core.chinacloudapi.cn).
 // It is read from the AZURE_STORAGE_DOMAIN environment variable.
 type StorageDomain string
+
+// Protocol is an protocol to access Azure Blob Storage.
+// It must be "http" or "https".
+// It is read from the AZURE_STORAGE_PROTOCOL environment variable.
+type Protocol string
 
 // DefaultAccountName loads the Azure storage account name from the
 // AZURE_STORAGE_ACCOUNT environment variable.
@@ -278,6 +417,23 @@ func DefaultStorageDomain() (StorageDomain, error) {
 	return StorageDomain(s), nil
 }
 
+// DefaultProtocol loads the protocol to access Azure Blob Storage from the
+// AZURE_STORAGE_PROTOCOL environment variable.
+func DefaultProtocol() (Protocol, error) {
+	s := os.Getenv("AZURE_STORAGE_PROTOCOL")
+	return Protocol(s), nil
+}
+
+// DefaultIsCDN loads the desired value of IsCDN from the
+// AZURE_STORAGE_IS_CDN environment variable.
+func DefaultIsCDN() (bool, error) {
+	s := os.Getenv("AZURE_STORAGE_IS_CDN")
+	if s == "" {
+		return false, nil
+	}
+	return strconv.ParseBool(s)
+}
+
 // NewCredential creates a SharedKeyCredential.
 func NewCredential(accountName AccountName, accountKey AccountKey) (*azblob.SharedKeyCredential, error) {
 	return azblob.NewSharedKeyCredential(string(accountName), string(accountKey))
@@ -298,6 +454,10 @@ type bucket struct {
 	serviceURL   *azblob.ServiceURL
 	containerURL azblob.ContainerURL
 	opts         *Options
+
+	mu                    sync.Mutex // protect the fields below
+	credentialExpiration  time.Time
+	delegationCredentials azblob.StorageAccountCredential
 }
 
 // OpenBucket returns a *blob.Bucket backed by Azure Storage Account. See the package
@@ -329,7 +489,25 @@ func openBucket(ctx context.Context, pipeline pipeline.Pipeline, accountName Acc
 		// If opts.StorageDomain is missing, use default domain.
 		opts.StorageDomain = "blob.core.windows.net"
 	}
-	blobURL, err := url.Parse(fmt.Sprintf("https://%s.%s", accountName, opts.StorageDomain))
+	switch opts.Protocol {
+	case "":
+		// If opts.Protocol is missing, use "https".
+		opts.Protocol = "https"
+	case "https", "http":
+	default:
+		return nil, errors.New("azureblob.OpenBucket: protocol must be http or https")
+	}
+	d := string(opts.StorageDomain)
+	var u string
+	// The URL structure of the local emulator is a bit different from the real one.
+	if strings.HasPrefix(d, "127.0.0.1") || strings.HasPrefix(d, "localhost") {
+		u = fmt.Sprintf("%s://%s/%s", opts.Protocol, opts.StorageDomain, accountName) // http://127.0.0.1:10000/devstoreaccount1
+	} else if opts.IsCDN {
+		u = fmt.Sprintf("%s://%s", opts.Protocol, opts.StorageDomain) // https://mycdnname.azureedge.net
+	} else {
+		u = fmt.Sprintf("%s://%s.%s", opts.Protocol, accountName, opts.StorageDomain) // https://myaccount.blob.core.windows.net
+	}
+	blobURL, err := url.Parse(u)
 	if err != nil {
 		return nil, err
 	}
@@ -362,6 +540,7 @@ func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.C
 	md := azblob.Metadata{}
 	mac := azblob.ModifiedAccessConditions{}
 	bac := azblob.BlobAccessConditions{}
+	at := azblob.AccessTierNone
 	if opts.BeforeCopy != nil {
 		asFunc := func(i interface{}) bool {
 			switch v := i.(type) {
@@ -381,7 +560,7 @@ func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.C
 			return err
 		}
 	}
-	resp, err := dstBlobURL.StartCopyFromURL(ctx, srcURL, md, mac, bac)
+	resp, err := dstBlobURL.StartCopyFromURL(ctx, srcURL, md, mac, bac, at, nil /* blogsTagMap */)
 	if err != nil {
 		return err
 	}
@@ -390,7 +569,7 @@ func (b *bucket) Copy(ctx context.Context, dstKey, srcKey string, opts *driver.C
 	for copyStatus == azblob.CopyStatusPending {
 		// Poll until the copy is complete.
 		time.Sleep(500 * time.Millisecond)
-		propertiesResp, err := dstBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{})
+		propertiesResp, err := dstBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 		if err != nil {
 			// A GetProperties failure may be transient, so allow a couple
 			// of them before giving up.
@@ -468,7 +647,7 @@ func (b *bucket) NewRangeReader(ctx context.Context, key string, offset, length 
 		}
 	}
 
-	blobDownloadResponse, err := blockBlobURLp.Download(ctx, offset, end, *accessConditions, false)
+	blobDownloadResponse, err := blockBlobURLp.Download(ctx, offset, end, *accessConditions, false, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -530,16 +709,20 @@ func (b *bucket) ErrorAs(err error, i interface{}) bool {
 }
 
 func (b *bucket) ErrorCode(err error) gcerrors.ErrorCode {
-	if code := gcerrors.Code(err); code != gcerrors.Unknown {
-		return code
-	}
 	serr, ok := err.(azblob.StorageError)
 	switch {
 	case !ok:
+		// This happens with an invalid storage account name; the host
+		// is something like invalidstorageaccount.blob.core.windows.net.
+		if strings.Contains(err.Error(), "no such host") {
+			return gcerrors.NotFound
+		}
 		return gcerrors.Unknown
 	case serr.ServiceCode() == azblob.ServiceCodeBlobNotFound || serr.Response().StatusCode == 404:
 		// Check and fail both the SDK ServiceCode and the Http Response Code for NotFound
 		return gcerrors.NotFound
+	case serr.ServiceCode() == azblob.ServiceCodeAuthenticationFailed:
+		return gcerrors.PermissionDenied
 	default:
 		return gcerrors.Unknown
 	}
@@ -549,7 +732,7 @@ func (b *bucket) ErrorCode(err error) gcerrors.ErrorCode {
 func (b *bucket) Attributes(ctx context.Context, key string) (*driver.Attributes, error) {
 	key = escapeKey(key, false)
 	blockBlobURL := b.containerURL.NewBlockBlobURL(key)
-	blobPropertiesResponse, err := blockBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{})
+	blobPropertiesResponse, err := blockBlobURL.GetProperties(ctx, azblob.BlobAccessConditions{}, azblob.ClientProvidedKeyOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -568,8 +751,10 @@ func (b *bucket) Attributes(ctx context.Context, key string) (*driver.Attributes
 		ContentLanguage:    blobPropertiesResponse.ContentLanguage(),
 		ContentType:        blobPropertiesResponse.ContentType(),
 		Size:               blobPropertiesResponse.ContentLength(),
-		MD5:                blobPropertiesResponse.ContentMD5(),
+		CreateTime:         blobPropertiesResponse.CreationTime(),
 		ModTime:            blobPropertiesResponse.LastModified(),
+		MD5:                blobPropertiesResponse.ContentMD5(),
+		ETag:               fmt.Sprintf("%v", blobPropertiesResponse.ETag()),
 		Metadata:           md,
 		AsFunc: func(i interface{}) bool {
 			p, ok := i.(*azblob.BlobGetPropertiesResponse)
@@ -643,7 +828,7 @@ func (b *bucket) ListPaged(ctx context.Context, opts *driver.ListOptions) (*driv
 			MD5:     blobInfo.Properties.ContentMD5,
 			IsDir:   false,
 			AsFunc: func(i interface{}) bool {
-				p, ok := i.(*azblob.BlobItem)
+				p, ok := i.(*azblob.BlobItemInternal)
 				if !ok {
 					return false
 				}
@@ -666,14 +851,47 @@ func (b *bucket) ListPaged(ctx context.Context, opts *driver.ListOptions) (*driv
 	return page, nil
 }
 
+func (b *bucket) refreshDelegationCredentials(ctx context.Context) (azblob.StorageAccountCredential, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if time.Now().UTC().After(b.credentialExpiration) {
+		validPeriod := 48 * time.Hour
+		currentTime := time.Now().UTC()
+		expires := currentTime.Add(validPeriod)
+		keyInfo := azblob.NewKeyInfo(currentTime, expires)
+
+		creds, err := b.serviceURL.GetUserDelegationCredential(ctx, keyInfo, nil /* default timeout */, nil /* no request id */)
+		if err != nil {
+			return nil, err
+		}
+
+		b.credentialExpiration = expires
+		b.delegationCredentials = creds
+	}
+
+	return b.delegationCredentials, nil
+}
+
 // SignedURL implements driver.SignedURL.
 func (b *bucket) SignedURL(ctx context.Context, key string, opts *driver.SignedURLOptions) (string, error) {
-	if b.opts.Credential == nil {
-		return "", errors.New("azureblob: to use SignedURL, you must call OpenBucket with a non-nil Options.Credential")
+	var credential azblob.StorageAccountCredential
+	if b.opts.Credential != nil {
+		credential = b.opts.Credential
+	} else if isMSIEnvironment := adal.MSIAvailable(ctx, adal.CreateSender()); isMSIEnvironment {
+		var err error
+		credential, err = b.refreshDelegationCredentials(ctx)
+		if err != nil {
+			return "", gcerr.New(gcerr.Internal, err, 1, "azureblob: unable to generate User Delegation Credential")
+		}
+	} else {
+		return "", gcerr.New(gcerr.Unimplemented, nil, 1, "azureblob: to use SignedURL, you must call OpenBucket with a non-nil Options.Credential")
 	}
+
 	if opts.ContentType != "" || opts.EnforceAbsentContentType {
 		return "", gcerr.New(gcerr.Unimplemented, nil, 1, "azureblob: does not enforce Content-Type on PUT")
 	}
+
 	key = escapeKey(key, false)
 	blockBlobURL := b.containerURL.NewBlockBlobURL(key)
 	srcBlobParts := azblob.NewBlobURLParts(blockBlobURL.URL())
@@ -690,15 +908,27 @@ func (b *bucket) SignedURL(ctx context.Context, key string, opts *driver.SignedU
 	default:
 		return "", fmt.Errorf("unsupported Method %s", opts.Method)
 	}
-	var err error
-	srcBlobParts.SAS, err = azblob.BlobSASSignatureValues{
+	signVals := &azblob.BlobSASSignatureValues{
 		Protocol:      azblob.SASProtocolHTTPS,
 		ExpiryTime:    time.Now().UTC().Add(opts.Expiry),
 		ContainerName: b.name,
 		BlobName:      srcBlobParts.BlobName,
 		Permissions:   perms.String(),
-	}.NewSASQueryParameters(b.opts.Credential)
-	if err != nil {
+	}
+	if opts.BeforeSign != nil {
+		asFunc := func(i interface{}) bool {
+			v, ok := i.(**azblob.BlobSASSignatureValues)
+			if ok {
+				*v = signVals
+			}
+			return ok
+		}
+		if err := opts.BeforeSign(asFunc); err != nil {
+			return "", err
+		}
+	}
+	var err error
+	if srcBlobParts.SAS, err = signVals.NewSASQueryParameters(credential); err != nil {
 		return "", err
 	}
 	srcBlobURLWithSAS := srcBlobParts.URL()

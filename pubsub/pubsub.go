@@ -76,13 +76,13 @@ import (
 	"time"
 	"unicode/utf8"
 
-	gax "github.com/googleapis/gax-go"
+	"github.com/googleapis/gax-go/v2"
 	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/batcher"
 	"gocloud.dev/internal/gcerr"
 	"gocloud.dev/internal/oc"
 	"gocloud.dev/internal/openurl"
 	"gocloud.dev/internal/retry"
+	"gocloud.dev/pubsub/batcher"
 	"gocloud.dev/pubsub/driver"
 	"golang.org/x/sync/errgroup"
 )
@@ -110,6 +110,16 @@ type Message struct {
 	// asFunc converts its argument to driver-specific types.
 	// See https://gocloud.dev/concepts/as/ for background information.
 	BeforeSend func(asFunc func(interface{}) bool) error
+
+	// AfterSend is a callback used when sending a message. It will always be
+	// set to nil for received messages.
+	//
+	// The callback will be called at most once, after the message is sent.
+	// If Send returns an error, AfterSend will not be called.
+	//
+	// asFunc converts its argument to driver-specific types.
+	// See https://gocloud.dev/concepts/as/ for background information.
+	AfterSend func(asFunc func(interface{}) bool) error
 
 	// asFunc invokes driver.Message.AsFunc.
 	asFunc func(interface{}) bool
@@ -244,6 +254,7 @@ func (t *Topic) Send(ctx context.Context, m *Message) (err error) {
 		Body:       m.Body,
 		Metadata:   m.Metadata,
 		BeforeSend: m.BeforeSend,
+		AfterSend:  m.AfterSend,
 	}
 	return t.batcher.Add(ctx, dm)
 }
@@ -258,7 +269,7 @@ func (t *Topic) Shutdown(ctx context.Context) (err error) {
 
 	t.mu.Lock()
 	if t.err == errTopicShutdown {
-		t.mu.Unlock()
+		defer t.mu.Unlock()
 		return t.err
 	}
 	t.err = errTopicShutdown
@@ -560,9 +571,12 @@ func (s *Subscription) Receive(ctx context.Context) (_ *Message, err error) {
 					s.err = err
 				} else if len(msgs) > 0 {
 					s.q = append(s.q, msgs...)
-					if s.throughputStart.IsZero() {
-						s.throughputStart = time.Now()
-					}
+				}
+				// Set the start time for measuring throughput even if we didn't get
+				// any messages; this allows batch size to decay over time if there
+				// aren't any message available.
+				if s.throughputStart.IsZero() {
+					s.throughputStart = time.Now()
 				}
 				close(s.waitc)
 				s.waitc = nil
@@ -607,8 +621,8 @@ func (s *Subscription) Receive(ctx context.Context) (_ *Message, err error) {
 			})
 			return m2, nil
 		}
-		// No messages are available.
-		if s.throughputEnd.IsZero() && !s.throughputStart.IsZero() {
+		// No messages are available. Close the interval for throughput measurement.
+		if s.throughputEnd.IsZero() && !s.throughputStart.IsZero() && s.throughputCount > 0 {
 			s.throughputEnd = time.Now()
 		}
 		// A call to ReceiveBatch must be in flight. Wait for it.
@@ -673,7 +687,7 @@ func (s *Subscription) Shutdown(ctx context.Context) (err error) {
 	s.mu.Lock()
 	if s.err == errSubscriptionShutdown {
 		// Already Shutdown.
-		s.mu.Unlock()
+		defer s.mu.Unlock()
 		return s.err
 	}
 	s.err = errSubscriptionShutdown

@@ -142,8 +142,8 @@ func (h *harness) CreateSubscription(_ context.Context, dt driver.Topic, testNam
 	return ds, cleanup, nil
 }
 
-func (h *harness) MakeNonexistentSubscription(_ context.Context) (driver.Subscription, error) {
-	return newSubscription(h.conn, "nonexistent-subscription"), nil
+func (h *harness) MakeNonexistentSubscription(_ context.Context) (driver.Subscription, func(), error) {
+	return newSubscription(h.conn, "nonexistent-subscription"), func() {}, nil
 }
 
 func (h *harness) Close() {
@@ -372,6 +372,10 @@ func (rabbitAsTest) BeforeSend(as func(interface{}) bool) error {
 	if !as(&pub) {
 		return fmt.Errorf("cast failed for %T", &pub)
 	}
+	return nil
+}
+
+func (rabbitAsTest) AfterSend(as func(interface{}) bool) error {
 	return nil
 }
 

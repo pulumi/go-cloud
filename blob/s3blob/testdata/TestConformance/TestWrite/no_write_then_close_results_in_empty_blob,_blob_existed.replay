@@ -1,7 +1,8 @@
 {
-  "Initial": "AQAAAA7U35MsAOyoO/5c",
+  "Initial": "AQAAAA7XW2bhJmbKqf4g",
   "Version": "0.2",
   "Converter": {
+    "ScrubBody": null,
     "ClearHeaders": [
       "^X-Goog-.*Encryption-Key$",
       "^X-Amz-Date$",
@@ -40,7 +41,7 @@
   },
   "Entries": [
     {
-      "ID": "c103513355f0fb21",
+      "ID": "b73c732d63380927",
       "Request": {
         "Method": "PUT",
         "URL": "https://go-cloud-testing.s3.us-west-1.amazonaws.com/blob-for-reading",
@@ -79,7 +80,7 @@
             "0"
           ],
           "Date": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Etag": [
             "\"d41d8cd98f00b204e9800998ecf8427e\""
@@ -88,17 +89,17 @@
             "AmazonS3"
           ],
           "X-Amz-Id-2": [
-            "lEmqEeH6ft99TNBrQhNuK9IE/ghA5a28CEP9AyMr5q6OX+61RyDbhFKe8mOeWW2mRL41QDu0uB0="
+            "KoIrsW9tBPWLKQPmi8aGL+vblk3zZF3W5Mew1FQGOgpCq+w4xXuwK3AwuXW5wVxBZwmbBe/atrU="
           ],
           "X-Amz-Request-Id": [
-            "0564100CDB2AFDC9"
+            "655985E92AED4097"
           ]
         },
         "Body": ""
       }
     },
     {
-      "ID": "9d725e14167bf279",
+      "ID": "e6a22301da20d7da",
       "Request": {
         "Method": "GET",
         "URL": "https://go-cloud-testing.s3.us-west-1.amazonaws.com/blob-for-reading",
@@ -137,29 +138,29 @@
             "text/plain; charset=utf-8"
           ],
           "Date": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Etag": [
             "\"d41d8cd98f00b204e9800998ecf8427e\""
           ],
           "Last-Modified": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Server": [
             "AmazonS3"
           ],
           "X-Amz-Id-2": [
-            "kOqzlEJyHuGsBhPoRz8DXp9haIO1wJXfR6GIHxmFwhLunqqnCL2pVusreHnb02qS1E8cFe9MwXE="
+            "Pj2QDi4I/+LxNEnVhkvdpMpZ5/VJOOwv014C6xUccZydxNpNqY4e9yab7b4KhtNAY37kexC1GUw="
           ],
           "X-Amz-Request-Id": [
-            "BA0B9FD5B9DF4261"
+            "1V3W3R6WEM8Q8YEG"
           ]
         },
         "Body": ""
       }
     },
     {
-      "ID": "70d9fc92081ca540",
+      "ID": "df6d08b6cc05a38a",
       "Request": {
         "Method": "HEAD",
         "URL": "https://go-cloud-testing.s3.us-west-1.amazonaws.com/blob-for-reading",
@@ -195,29 +196,29 @@
             "text/plain; charset=utf-8"
           ],
           "Date": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Etag": [
             "\"d41d8cd98f00b204e9800998ecf8427e\""
           ],
           "Last-Modified": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Server": [
             "AmazonS3"
           ],
           "X-Amz-Id-2": [
-            "OUMlnAJqdFr7y2kb/MNZCXwBS7AaPpJy+iNjJs8gFSWo6zQ2hLPi+pAoTlJqIzLo9c5HTd3XxT8="
+            "Gi2YjXrXdf2Vtju8yRhJk43DxslLGOgZWf+rMrfBQIZfO7BeUO4moX+Yg9QHy6nQYRY4NyIWrfw="
           ],
           "X-Amz-Request-Id": [
-            "ACF13EA75D76E4A1"
+            "AFFDD448A1A92D31"
           ]
         },
         "Body": ""
       }
     },
     {
-      "ID": "cb82dd4877f97400",
+      "ID": "145816bcbdd5ea04",
       "Request": {
         "Method": "DELETE",
         "URL": "https://go-cloud-testing.s3.us-west-1.amazonaws.com/blob-for-reading",
@@ -247,16 +248,16 @@
         "ProtoMinor": 1,
         "Header": {
           "Date": [
-            "Fri, 09 Aug 2019 16:15:41 GMT"
+            "Thu, 03 Dec 2020 23:08:18 GMT"
           ],
           "Server": [
             "AmazonS3"
           ],
           "X-Amz-Id-2": [
-            "AL19Odoixf4Li3swtxzeKOPblyIjsmTGuX5vDp7cRIPNY3ji1iRgaY9ix6RizwyDUze54JApaPQ="
+            "eSFWDn+BCQdJf2eEo0bzOl9/NlgPzCeqPi/pA72klA1epii3unwSNxD5IfgkhbjM1hgsfMV6aVA="
           ],
           "X-Amz-Request-Id": [
-            "6DE759AE4F9CE4C3"
+            "2511726E248CB3BF"
           ]
         },
         "Body": ""

@@ -20,12 +20,14 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/Azure/azure-pipeline-go/pipeline"
 	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/google/go-cmp/cmp"
 	"gocloud.dev/blob"
 	"gocloud.dev/blob/driver"
 	"gocloud.dev/blob/drivertest"
@@ -114,6 +116,10 @@ func (h *harness) HTTPClient() *http.Client {
 
 func (h *harness) MakeDriver(ctx context.Context) (driver.Bucket, error) {
 	return openBucket(ctx, h.pipeline, accountName, bucketName, &Options{Credential: h.credential})
+}
+
+func (h *harness) MakeDriverForNonexistentBucket(ctx context.Context) (driver.Bucket, error) {
+	return openBucket(ctx, h.pipeline, accountName, "bucket-does-not-exist", &Options{Credential: h.credential})
 }
 
 func (h *harness) Close() {
@@ -219,6 +225,14 @@ func (verifyContentLanguage) BeforeList(as func(interface{}) bool) error {
 	return nil
 }
 
+func (verifyContentLanguage) BeforeSign(as func(interface{}) bool) error {
+	var azOpts *azblob.BlobSASSignatureValues
+	if !as(&azOpts) {
+		return errors.New("BeforeSign.As failed")
+	}
+	return nil
+}
+
 func (verifyContentLanguage) AttributesCheck(attrs *blob.Attributes) error {
 	var resp azblob.BlobGetPropertiesResponse
 	if !attrs.As(&resp) {
@@ -249,7 +263,7 @@ func (verifyContentLanguage) ListObjectCheck(o *blob.ListObject) error {
 		}
 		return nil
 	}
-	var item azblob.BlobItem
+	var item azblob.BlobItemInternal
 	if !o.As(&item) {
 		return errors.New("ListObject.As for object returned false")
 	}
@@ -327,30 +341,44 @@ func TestOpenerFromEnv(t *testing.T) {
 		accountKey    AccountKey
 		storageDomain StorageDomain
 		sasToken      SASToken
+		protocol      Protocol
+		isCDN         bool
 
 		wantSharedCreds   bool
 		wantSASToken      SASToken
 		wantStorageDomain StorageDomain
+		wantProtocol      Protocol
+		wantIsCDN         bool
 	}{
 		{
 			name:            "AccountKey",
 			accountName:     "myaccount",
 			accountKey:      AccountKey(base64.StdEncoding.EncodeToString([]byte("FAKECREDS"))),
 			wantSharedCreds: true,
+			wantIsCDN:       false,
 		},
 		{
 			name:              "SASToken",
 			accountName:       "myaccount",
 			sasToken:          "borkborkbork",
 			storageDomain:     "mycloudenv",
+			protocol:          "http",
+			isCDN:             true,
 			wantSharedCreds:   false,
 			wantSASToken:      "borkborkbork",
 			wantStorageDomain: "mycloudenv",
+			wantProtocol:      "http",
+			wantIsCDN:         true,
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			o, err := openerFromEnv(test.accountName, test.accountKey, test.sasToken, test.storageDomain)
+			opts := Options{
+				StorageDomain: test.storageDomain,
+				Protocol:      test.protocol,
+				IsCDN:         test.isCDN,
+			}
+			o, err := openerFromEnv(test.accountName, test.accountKey, test.sasToken, opts)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -378,6 +406,147 @@ func TestOpenerFromEnv(t *testing.T) {
 			if o.Options.StorageDomain != test.wantStorageDomain {
 				t.Errorf("Options.StorageDomain = %q; want %q", o.Options.StorageDomain, test.wantStorageDomain)
 			}
+			if o.Options.Protocol != test.wantProtocol {
+				t.Errorf("Options.Protocol = %q; want %q", o.Options.Protocol, test.wantProtocol)
+			}
+			if o.Options.IsCDN != test.wantIsCDN {
+				t.Errorf("Options.IsCDN = %v; want %v", o.Options.IsCDN, test.wantIsCDN)
+			}
+		})
+	}
+}
+
+func Test_openBucket(t *testing.T) {
+	tests := []struct {
+		name             string
+		protocol         Protocol
+		storageDomain    StorageDomain
+		isCDN            bool
+		wantContainerURL string
+		wantErr          bool
+	}{
+		{
+			name:             "empty protocol",
+			protocol:         "",
+			wantContainerURL: "https://gocloudblobtests.blob.core.windows.net/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "http",
+			protocol:         "http",
+			wantContainerURL: "http://gocloudblobtests.blob.core.windows.net/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "local emulator 127.0.0.1:10000",
+			protocol:         "http",
+			storageDomain:    "127.0.0.1:10000",
+			wantContainerURL: "http://127.0.0.1:10000/gocloudblobtests/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "local emulator localhost:10000",
+			protocol:         "http",
+			storageDomain:    "localhost:10000",
+			wantContainerURL: "http://localhost:10000/gocloudblobtests/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "custom storage domain",
+			protocol:         "",
+			storageDomain:    "blob.core.usgovcloudapi.net",
+			wantContainerURL: "https://gocloudblobtests.blob.core.usgovcloudapi.net/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "https",
+			protocol:         "https",
+			wantContainerURL: "https://gocloudblobtests.blob.core.windows.net/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "cdn",
+			storageDomain:    "mycdnname.azureedge.net",
+			isCDN:            true,
+			wantContainerURL: "https://mycdnname.azureedge.net/mycontainer",
+			wantErr:          false,
+		},
+		{
+			name:             "invalid",
+			protocol:         "invalid",
+			wantContainerURL: "",
+			wantErr:          true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			ctx := context.Background()
+			accountKey := base64.StdEncoding.EncodeToString([]byte("FAKECREDS"))
+			cred, err := azblob.NewSharedKeyCredential(string(accountName), accountKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			pipeline := azblob.NewPipeline(cred, azblob.PipelineOptions{})
+			containerName := "mycontainer"
+			o := &Options{Protocol: test.protocol, StorageDomain: test.storageDomain, IsCDN: test.isCDN}
+			b, err := openBucket(ctx, pipeline, accountName, containerName, o)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("wantErr=%v but got=%v", test.wantErr, err)
+			}
+			if !test.wantErr {
+				gotURL := b.containerURL.String()
+				if gotURL != test.wantContainerURL {
+					t.Errorf("got containerURL = %v, want = %v", gotURL, test.wantContainerURL)
+				}
+			}
+		})
+	}
+}
+
+func TestURLOpenerForParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		currOpts Options
+		query    url.Values
+		wantOpts Options
+		wantErr  bool
+	}{
+		{
+			name: "InvalidParam",
+			query: url.Values{
+				"foo": {"bar"},
+			},
+			wantErr: true,
+		},
+		{
+			name: "StorageDomain",
+			query: url.Values{
+				"domain": {"blob.core.usgovcloudapi.net"},
+			},
+			wantOpts: Options{StorageDomain: "blob.core.usgovcloudapi.net"},
+		},
+		{
+			name: "duplicate StorageDomain",
+			query: url.Values{
+				"domain": {"blob.core.usgovcloudapi.net", "blob.core.windows.net"},
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			o := &URLOpener{Options: test.currOpts}
+			err := setOptionsFromURLParams(test.query, &o.Options)
+			if (err != nil) != test.wantErr {
+				t.Errorf("got err %v want error %v", err, test.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if diff := cmp.Diff(o.Options, test.wantOpts); diff != "" {
+				t.Errorf("opener.forParams(...) diff (-want +got):\n%s", diff)
+			}
 		})
 	}
 }
@@ -386,13 +555,19 @@ func TestOpenBucketFromURL(t *testing.T) {
 	prevAccount := os.Getenv("AZURE_STORAGE_ACCOUNT")
 	prevKey := os.Getenv("AZURE_STORAGE_KEY")
 	prevEnv := os.Getenv("AZURE_STORAGE_DOMAIN")
+	prevProtocol := os.Getenv("AZURE_STORAGE_PROTOCOL")
+	prevIsCDN := os.Getenv("AZURE_STORAGE_IS_CDN")
 	os.Setenv("AZURE_STORAGE_ACCOUNT", "my-account")
 	os.Setenv("AZURE_STORAGE_KEY", "bXlrZXk=") // mykey base64 encoded
 	os.Setenv("AZURE_STORAGE_DOMAIN", "my-cloud")
+	os.Setenv("AZURE_STORAGE_PROTOCOL", "http")
+	os.Setenv("AZURE_STORAGE_IS_CDN", "false")
 	defer func() {
 		os.Setenv("AZURE_STORAGE_ACCOUNT", prevAccount)
 		os.Setenv("AZURE_STORAGE_KEY", prevKey)
 		os.Setenv("AZURE_STORAGE_DOMAIN", prevEnv)
+		os.Setenv("AZURE_STORAGE_PROTOCOL", prevProtocol)
+		os.Setenv("AZURE_STORAGE_IS_CDN", prevIsCDN)
 	}()
 
 	tests := []struct {
@@ -401,6 +576,18 @@ func TestOpenBucketFromURL(t *testing.T) {
 	}{
 		// OK.
 		{"azblob://mybucket", false},
+		// With storage domain.
+		{"azblob://mybucket?domain=blob.core.usgovcloudapi.net", false},
+		// With duplicate storage domain.
+		{"azblob://mybucket?domain=blob.core.usgovcloudapi.net&domain=blob.core.windows.net", true},
+		// With protocol.
+		{"azblob://mybucket?protocol=http", false},
+		// With invalid protocol.
+		{"azblob://mybucket?protocol=ftp", true},
+		// With CDN.
+		{"azblob://mybucket?cdn=true", false},
+		// With invalid CDN.
+		{"azblob://mybucket?cdn=42", true},
 		// Invalid parameter.
 		{"azblob://mybucket?param=value", true},
 	}

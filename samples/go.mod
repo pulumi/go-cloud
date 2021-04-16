@@ -17,27 +17,26 @@ module gocloud.dev/samples
 go 1.12
 
 require (
-	contrib.go.opencensus.io/exporter/stackdriver v0.12.1
-	github.com/Azure/azure-pipeline-go v0.2.1
-	github.com/Azure/azure-storage-blob-go v0.8.0
-	github.com/aws/aws-sdk-go v1.30.7
+	contrib.go.opencensus.io/exporter/stackdriver v0.13.4
+	github.com/Azure/azure-pipeline-go v0.2.3
+	github.com/Azure/azure-storage-blob-go v0.13.0
+	github.com/aws/aws-sdk-go v1.37.31
 	github.com/go-sql-driver/mysql v1.5.0
-	github.com/google/go-cmdtest v0.1.0
-	github.com/google/go-cmp v0.4.0
-	github.com/google/subcommands v1.0.1
-	github.com/google/uuid v1.1.1
-	github.com/google/wire v0.4.0
-	github.com/gorilla/mux v1.7.2
-	github.com/streadway/amqp v0.0.0-20200108173154-1c71cc93ed71
-	go.opencensus.io v0.22.3
-	gocloud.dev v0.19.0
-	gocloud.dev/docstore/mongodocstore v0.19.0
-	gocloud.dev/pubsub/kafkapubsub v0.19.0
-	gocloud.dev/pubsub/natspubsub v0.19.0
-	gocloud.dev/pubsub/rabbitpubsub v0.19.0
-	gocloud.dev/runtimevar/etcdvar v0.19.0
-	gocloud.dev/secrets/hashivault v0.19.0
-	google.golang.org/genproto v0.0.0-20200205142000-a86caf926a67
+	github.com/google/go-cmdtest v0.3.0
+	github.com/google/go-cmp v0.5.4
+	github.com/google/subcommands v1.2.0
+	github.com/google/uuid v1.1.2
+	github.com/google/wire v0.5.0
+	github.com/gorilla/mux v1.8.0
+	github.com/streadway/amqp v1.0.0
+	go.opencensus.io v0.22.5
+	gocloud.dev v0.22.0
+	gocloud.dev/docstore/mongodocstore v0.22.0
+	gocloud.dev/pubsub/kafkapubsub v0.22.0
+	gocloud.dev/pubsub/natspubsub v0.22.0
+	gocloud.dev/pubsub/rabbitpubsub v0.22.0
+	gocloud.dev/secrets/hashivault v0.22.0
+	google.golang.org/genproto v0.0.0-20201203001206-6486ece9c497
 	gopkg.in/pipe.v2 v2.0.0-20140414041502-3c2ca4d52544
 )
 
@@ -50,7 +49,5 @@ replace gocloud.dev/pubsub/kafkapubsub => ../pubsub/kafkapubsub
 replace gocloud.dev/pubsub/natspubsub => ../pubsub/natspubsub
 
 replace gocloud.dev/pubsub/rabbitpubsub => ../pubsub/rabbitpubsub
-
-replace gocloud.dev/runtimevar/etcdvar => ../runtimevar/etcdvar
 
 replace gocloud.dev/secrets/hashivault => ../secrets/hashivault

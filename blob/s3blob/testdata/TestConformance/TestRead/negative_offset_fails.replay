@@ -1,7 +1,8 @@
 {
-  "Initial": "AQAAAA7U35MrBFwn0P5c",
+  "Initial": "AQAAAA7XW2bgGSoFLP4g",
   "Version": "0.2",
   "Converter": {
+    "ScrubBody": null,
     "ClearHeaders": [
       "^X-Goog-.*Encryption-Key$",
       "^X-Amz-Date$",

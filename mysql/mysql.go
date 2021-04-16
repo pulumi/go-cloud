@@ -19,7 +19,9 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 
 	"github.com/go-sql-driver/mysql"
@@ -37,29 +39,62 @@ func init() {
 }
 
 // URLOpener opens URLs like "mysql://" by using the underlying MySQL driver.
-// See https://godoc.org/github.com/lib/pq#hdr-Connection_String_Parameters for details.
-type URLOpener struct{}
-
-// OpenMySQLURL opens a new database connection wrapped with OpenCensus instrumentation.
-func (*URLOpener) OpenMySQLURL(ctx context.Context, u *url.URL) (*sql.DB, error) {
-	db, err := openWithURL(u)
-	return db, err
+// like "mysql://user:password@localhost:3306/mydb".
+type URLOpener struct {
+	TraceOpts []ocsql.TraceOption
 }
 
-func openWithURL(url *url.URL) (*sql.DB, error) {
-	return sql.OpenDB(connector{dsn: strings.TrimPrefix(url.String(), Scheme+"://")}), nil
+// OpenMySQLURL opens a new database connection wrapped with OpenCensus instrumentation.
+func (uo *URLOpener) OpenMySQLURL(_ context.Context, u *url.URL) (*sql.DB, error) {
+	cfg, err := ConfigFromURL(u)
+	if err != nil {
+		return nil, err
+	}
+	return sql.OpenDB(connector{
+		dsn:       cfg.FormatDSN(),
+		traceOpts: append([]ocsql.TraceOption(nil), uo.TraceOpts...),
+	}), nil
+}
+
+var netAddrRE = regexp.MustCompile(`^(.+)\((.+)\)$`)
+
+// ConfigFromURL creates a mysql.Config from URL.
+func ConfigFromURL(u *url.URL) (cfg *mysql.Config, err error) {
+	dbName := strings.TrimPrefix(u.Path, "/")
+	if u.RawQuery != "" {
+		optDsn := fmt.Sprintf("/%s?%s", dbName, u.RawQuery)
+		if cfg, err = mysql.ParseDSN(optDsn); err != nil {
+			return nil, err
+		}
+	} else {
+		cfg = mysql.NewConfig()
+	}
+	if matches := netAddrRE.FindStringSubmatch(u.Host); len(matches) == 3 {
+		cfg.Net = matches[1]
+		cfg.Addr = matches[2]
+	} else {
+		cfg.Net = "tcp"
+		cfg.Addr = u.Host
+	}
+	cfg.User = u.User.Username()
+	cfg.Passwd, _ = u.User.Password()
+	cfg.DBName = dbName
+	cfg.AllowCleartextPasswords = true
+	cfg.AllowNativePasswords = true
+	return cfg, nil
 }
 
 type connector struct {
-	dsn string
+	dsn       string
+	traceOpts []ocsql.TraceOption
 }
 
-func (c connector) Connect(ctx context.Context) (driver.Conn, error) {
+func (c connector) Connect(context.Context) (driver.Conn, error) {
 	return c.Driver().Open(c.dsn)
 }
 
 func (c connector) Driver() driver.Driver {
-	return ocsql.Wrap(mysql.MySQLDriver{})
+	return ocsql.Wrap(mysql.MySQLDriver{}, c.traceOpts...)
 }
 
 // A type that implements MySQLURLOpener can open connection based on a URL.

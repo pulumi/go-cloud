@@ -104,14 +104,12 @@ func (h *harness) MakeNonexistentTopic(ctx context.Context) (driver.Topic, error
 func (h *harness) CreateSubscription(ctx context.Context, dt driver.Topic, testName string) (driver.Subscription, func(), error) {
 	groupID := fmt.Sprintf("%s-sub-%d-%d", sanitize(testName), h.uniqueID, atomic.AddUint32(&h.numSubs, 1))
 	ds, err := openSubscription(localBrokerAddrs, MinimalConfig(), groupID, []string{dt.(*topic).topicName}, subscriptionOptions)
-	if err != nil {
-		return nil, nil, err
-	}
-	return ds, func() {}, nil
+	return ds, func() {}, err
 }
 
-func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, error) {
-	return openSubscription(localBrokerAddrs, MinimalConfig(), "unused-group", []string{"nonexistent-topic"}, subscriptionOptions)
+func (h *harness) MakeNonexistentSubscription(ctx context.Context) (driver.Subscription, func(), error) {
+	ds, err := openSubscription(localBrokerAddrs, MinimalConfig(), "unused-group", []string{"nonexistent-topic"}, subscriptionOptions)
+	return ds, func() {}, err
 }
 
 func (h *harness) Close() {}
@@ -180,6 +178,10 @@ func (asTest) BeforeSend(as func(interface{}) bool) error {
 	if !as(&pm) {
 		return fmt.Errorf("cast failed for %T", &pm)
 	}
+	return nil
+}
+
+func (asTest) AfterSend(as func(interface{}) bool) error {
 	return nil
 }
 

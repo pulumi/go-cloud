@@ -59,6 +59,7 @@
 //  - Subscription: *sqs.SQS
 //  - Message: *sqs.Message
 //  - Message.BeforeSend: *sns.PublishInput for OpenSNSTopic; *sqs.SendMessageBatchRequestEntry or *sqs.SendMessageInput(deprecated) for OpenSQSTopic
+//  - Message.AfterSend: *sns.PublishOutput for OpenSNSTopic; *sqs.SendMessageBatchResultEntry for OpenSQSTopic
 //  - Error: awserror.Error
 package awssnssqs // import "gocloud.dev/pubsub/awssnssqs"
 
@@ -83,10 +84,9 @@ import (
 	"github.com/google/wire"
 	gcaws "gocloud.dev/aws"
 	"gocloud.dev/gcerrors"
-	"gocloud.dev/internal/batcher"
 	"gocloud.dev/internal/escape"
-	"gocloud.dev/internal/gcerr"
 	"gocloud.dev/pubsub"
+	"gocloud.dev/pubsub/batcher"
 	"gocloud.dev/pubsub/driver"
 )
 
@@ -198,6 +198,7 @@ const SQSScheme = "awssqs"
 //
 //   - raw (for "awssqs" Subscriptions only): sets SubscriberOptions.Raw. The
 //     value must be parseable by `strconv.ParseBool`.
+//   - waittime: sets SubscriberOptions.WaitTime, in time.ParseDuration formats.
 //
 // See gocloud.dev/aws/ConfigFromURLParams for other query parameters
 // that affect the default AWS session.
@@ -251,6 +252,14 @@ func (o *URLOpener) OpenSubscriptionURL(ctx context.Context, u *url.URL) (*pubsu
 			return nil, fmt.Errorf("invalid value %q for raw: %v", rawStr, err)
 		}
 		q.Del("raw")
+	}
+	if waitTimeStr := q.Get("waittime"); waitTimeStr != "" {
+		var err error
+		opts.WaitTime, err = time.ParseDuration(waitTimeStr)
+		if err != nil {
+			return nil, fmt.Errorf("invalid value %q for waittime: %v", waitTimeStr, err)
+		}
+		q.Del("waittime")
 	}
 	overrideCfg, err := gcaws.ConfigFromURLParams(q)
 	if err != nil {
@@ -407,8 +416,23 @@ func (t *snsTopic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 			return err
 		}
 	}
-	_, err := t.client.PublishWithContext(ctx, input)
-	return err
+	po, err := t.client.PublishWithContext(ctx, input)
+	if err != nil {
+		return err
+	}
+	if dm.AfterSend != nil {
+		asFunc := func(i interface{}) bool {
+			if p, ok := i.(**sns.PublishOutput); ok {
+				*p = po
+				return true
+			}
+			return false
+		}
+		if err := dm.AfterSend(asFunc); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // IsRetryable implements driver.Topic.IsRetryable.
@@ -534,6 +558,22 @@ func (t *sqsTopic) SendBatch(ctx context.Context, dms []*driver.Message) error {
 		first := resp.Failed[0]
 		return awserr.New(aws.StringValue(first.Code), fmt.Sprintf("sqs.SendMessageBatch failed for %d message(s): %s", numFailed, aws.StringValue(first.Message)), nil)
 	}
+	if len(resp.Successful) == len(dms) {
+		for n, dm := range dms {
+			if dm.AfterSend != nil {
+				asFunc := func(i interface{}) bool {
+					if p, ok := i.(**sqs.SendMessageBatchResultEntry); ok {
+						*p = resp.Successful[n]
+						return true
+					}
+					return false
+				}
+				if err := dm.AfterSend(asFunc); err != nil {
+					return err
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -569,51 +609,51 @@ func (*sqsTopic) Close() error { return nil }
 func errorCode(err error) gcerrors.ErrorCode {
 	ae, ok := err.(awserr.Error)
 	if !ok {
-		return gcerr.Unknown
+		return gcerrors.Unknown
 	}
 	ec, ok := errorCodeMap[ae.Code()]
 	if !ok {
-		return gcerr.Unknown
+		return gcerrors.Unknown
 	}
 	return ec
 }
 
 var errorCodeMap = map[string]gcerrors.ErrorCode{
-	sns.ErrCodeAuthorizationErrorException:          gcerr.PermissionDenied,
-	sns.ErrCodeKMSAccessDeniedException:             gcerr.PermissionDenied,
-	sns.ErrCodeKMSDisabledException:                 gcerr.FailedPrecondition,
-	sns.ErrCodeKMSInvalidStateException:             gcerr.FailedPrecondition,
-	sns.ErrCodeKMSOptInRequired:                     gcerr.FailedPrecondition,
-	sqs.ErrCodeMessageNotInflight:                   gcerr.FailedPrecondition,
-	sqs.ErrCodePurgeQueueInProgress:                 gcerr.FailedPrecondition,
-	sqs.ErrCodeQueueDeletedRecently:                 gcerr.FailedPrecondition,
-	sqs.ErrCodeQueueNameExists:                      gcerr.FailedPrecondition,
-	sns.ErrCodeInternalErrorException:               gcerr.Internal,
-	sns.ErrCodeInvalidParameterException:            gcerr.InvalidArgument,
-	sns.ErrCodeInvalidParameterValueException:       gcerr.InvalidArgument,
-	sqs.ErrCodeBatchEntryIdsNotDistinct:             gcerr.InvalidArgument,
-	sqs.ErrCodeBatchRequestTooLong:                  gcerr.InvalidArgument,
-	sqs.ErrCodeEmptyBatchRequest:                    gcerr.InvalidArgument,
-	sqs.ErrCodeInvalidAttributeName:                 gcerr.InvalidArgument,
-	sqs.ErrCodeInvalidBatchEntryId:                  gcerr.InvalidArgument,
-	sqs.ErrCodeInvalidIdFormat:                      gcerr.InvalidArgument,
-	sqs.ErrCodeInvalidMessageContents:               gcerr.InvalidArgument,
-	sqs.ErrCodeReceiptHandleIsInvalid:               gcerr.InvalidArgument,
-	sqs.ErrCodeTooManyEntriesInBatchRequest:         gcerr.InvalidArgument,
-	sqs.ErrCodeUnsupportedOperation:                 gcerr.InvalidArgument,
-	sns.ErrCodeInvalidSecurityException:             gcerr.PermissionDenied,
-	sns.ErrCodeKMSNotFoundException:                 gcerr.NotFound,
-	sns.ErrCodeNotFoundException:                    gcerr.NotFound,
-	sqs.ErrCodeQueueDoesNotExist:                    gcerr.NotFound,
-	sns.ErrCodeFilterPolicyLimitExceededException:   gcerr.ResourceExhausted,
-	sns.ErrCodeSubscriptionLimitExceededException:   gcerr.ResourceExhausted,
-	sns.ErrCodeTopicLimitExceededException:          gcerr.ResourceExhausted,
-	sqs.ErrCodeOverLimit:                            gcerr.ResourceExhausted,
-	sns.ErrCodeKMSThrottlingException:               gcerr.ResourceExhausted,
-	sns.ErrCodeThrottledException:                   gcerr.ResourceExhausted,
-	"RequestCanceled":                               gcerr.Canceled,
-	sns.ErrCodeEndpointDisabledException:            gcerr.Unknown,
-	sns.ErrCodePlatformApplicationDisabledException: gcerr.Unknown,
+	sns.ErrCodeAuthorizationErrorException:          gcerrors.PermissionDenied,
+	sns.ErrCodeKMSAccessDeniedException:             gcerrors.PermissionDenied,
+	sns.ErrCodeKMSDisabledException:                 gcerrors.FailedPrecondition,
+	sns.ErrCodeKMSInvalidStateException:             gcerrors.FailedPrecondition,
+	sns.ErrCodeKMSOptInRequired:                     gcerrors.FailedPrecondition,
+	sqs.ErrCodeMessageNotInflight:                   gcerrors.FailedPrecondition,
+	sqs.ErrCodePurgeQueueInProgress:                 gcerrors.FailedPrecondition,
+	sqs.ErrCodeQueueDeletedRecently:                 gcerrors.FailedPrecondition,
+	sqs.ErrCodeQueueNameExists:                      gcerrors.FailedPrecondition,
+	sns.ErrCodeInternalErrorException:               gcerrors.Internal,
+	sns.ErrCodeInvalidParameterException:            gcerrors.InvalidArgument,
+	sns.ErrCodeInvalidParameterValueException:       gcerrors.InvalidArgument,
+	sqs.ErrCodeBatchEntryIdsNotDistinct:             gcerrors.InvalidArgument,
+	sqs.ErrCodeBatchRequestTooLong:                  gcerrors.InvalidArgument,
+	sqs.ErrCodeEmptyBatchRequest:                    gcerrors.InvalidArgument,
+	sqs.ErrCodeInvalidAttributeName:                 gcerrors.InvalidArgument,
+	sqs.ErrCodeInvalidBatchEntryId:                  gcerrors.InvalidArgument,
+	sqs.ErrCodeInvalidIdFormat:                      gcerrors.InvalidArgument,
+	sqs.ErrCodeInvalidMessageContents:               gcerrors.InvalidArgument,
+	sqs.ErrCodeReceiptHandleIsInvalid:               gcerrors.InvalidArgument,
+	sqs.ErrCodeTooManyEntriesInBatchRequest:         gcerrors.InvalidArgument,
+	sqs.ErrCodeUnsupportedOperation:                 gcerrors.InvalidArgument,
+	sns.ErrCodeInvalidSecurityException:             gcerrors.PermissionDenied,
+	sns.ErrCodeKMSNotFoundException:                 gcerrors.NotFound,
+	sns.ErrCodeNotFoundException:                    gcerrors.NotFound,
+	sqs.ErrCodeQueueDoesNotExist:                    gcerrors.NotFound,
+	sns.ErrCodeFilterPolicyLimitExceededException:   gcerrors.ResourceExhausted,
+	sns.ErrCodeSubscriptionLimitExceededException:   gcerrors.ResourceExhausted,
+	sns.ErrCodeTopicLimitExceededException:          gcerrors.ResourceExhausted,
+	sqs.ErrCodeOverLimit:                            gcerrors.ResourceExhausted,
+	sns.ErrCodeKMSThrottlingException:               gcerrors.ResourceExhausted,
+	sns.ErrCodeThrottledException:                   gcerrors.ResourceExhausted,
+	"RequestCanceled":                               gcerrors.Canceled,
+	sns.ErrCodeEndpointDisabledException:            gcerrors.Unknown,
+	sns.ErrCodePlatformApplicationDisabledException: gcerrors.Unknown,
 }
 
 type subscription struct {
@@ -636,6 +676,12 @@ type SubscriptionOptions struct {
 	//
 	// See https://aws.amazon.com/sns/faqs/#Raw_message_delivery.
 	Raw bool
+
+	// WaitTime passed to ReceiveMessage to enable long polling.
+	// https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-short-and-long-polling.html#sqs-long-polling.
+	// Note that a non-zero WaitTime can delay delivery of messages
+	// by up to that duration.
+	WaitTime time.Duration
 }
 
 // OpenSubscription opens a subscription based on AWS SQS for the given SQS
@@ -655,16 +701,22 @@ func openSubscription(ctx context.Context, sess client.ConfigProvider, qURL stri
 
 // ReceiveBatch implements driver.Subscription.ReceiveBatch.
 func (s *subscription) ReceiveBatch(ctx context.Context, maxMessages int) ([]*driver.Message, error) {
-	output, err := s.client.ReceiveMessageWithContext(ctx, &sqs.ReceiveMessageInput{
+	req := &sqs.ReceiveMessageInput{
 		QueueUrl:              aws.String(s.qURL),
 		MaxNumberOfMessages:   aws.Int64(int64(maxMessages)),
 		MessageAttributeNames: []*string{aws.String("All")},
-	})
+		AttributeNames:        []*string{aws.String("All")},
+	}
+	if s.opts.WaitTime != 0 {
+		req.WaitTimeSeconds = aws.Int64(int64(s.opts.WaitTime.Seconds()))
+	}
+	output, err := s.client.ReceiveMessageWithContext(ctx, req)
 	if err != nil {
 		return nil, err
 	}
 	var ms []*driver.Message
 	for _, m := range output.Messages {
+		m := m
 		bodyStr, rawAttrs := extractBody(m, s.opts.Raw)
 
 		decodeIt := false

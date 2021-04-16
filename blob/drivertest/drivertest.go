@@ -50,6 +50,9 @@ type Harness interface {
 	// same storage bucket; i.e., a blob created using one driver.Bucket must
 	// be readable by a subsequent driver.Bucket.
 	MakeDriver(ctx context.Context) (driver.Bucket, error)
+	// MakeDriverForNonexistentBucket creates a driver.Bucket for a nonexistent
+	// bucket. If that concept doesn't make sense for a driver, return (nil, nil).
+	MakeDriverForNonexistentBucket(ctx context.Context) (driver.Bucket, error)
 	// HTTPClient should return an unauthorized *http.Client, or nil.
 	// Required if the service supports SignedURL.
 	HTTPClient() *http.Client
@@ -75,6 +78,8 @@ type HarnessMaker func(ctx context.Context, t *testing.T) (Harness, error)
 //    on the single blob entry returned.
 // 7. Tries to read a non-existent blob, and calls ErrorCheck with the error.
 // 8. Makes a copy of the blob, using BeforeCopy as a CopyOption.
+// 9. Calls SignedURL using BeforeSign as a SignedURLOption for each supported
+//    signing method (i.e. GET, PUT and DELETE).
 //
 // For example, an AsTest might set a driver-specific field to a custom
 // value in BeforeWrite, and then verify the custom value was returned in
@@ -98,6 +103,9 @@ type AsTest interface {
 	// BeforeList will be passed directly to ListOptions as part of listing the
 	// test blob.
 	BeforeList(as func(interface{}) bool) error
+	// BeforeSign will be passed directly to SignedURLOptions as part of
+	// generating a signed URL to the test blob.
+	BeforeSign(as func(interface{}) bool) error
 	// AttributesCheck will be called after fetching the test blob's attributes.
 	// It should call attrs.As and verify the results.
 	AttributesCheck(attrs *blob.Attributes) error
@@ -160,6 +168,13 @@ func (verifyAsFailsOnNil) BeforeList(as func(interface{}) bool) error {
 	return nil
 }
 
+func (verifyAsFailsOnNil) BeforeSign(as func(interface{}) bool) error {
+	if as(nil) {
+		return errors.New("want BeforeSign's As to return false when passed nil")
+	}
+	return nil
+}
+
 func (verifyAsFailsOnNil) AttributesCheck(attrs *blob.Attributes) error {
 	if attrs.As(nil) {
 		return errors.New("want Attributes.As to return false when passed nil")
@@ -183,6 +198,9 @@ func (verifyAsFailsOnNil) ListObjectCheck(o *blob.ListObject) error {
 
 // RunConformanceTests runs conformance tests for driver implementations of blob.
 func RunConformanceTests(t *testing.T, newHarness HarnessMaker, asTests []AsTest) {
+	t.Run("TestNonexistentBucket", func(t *testing.T) {
+		testNonexistentBucket(t, newHarness)
+	})
 	t.Run("TestList", func(t *testing.T) {
 		testList(t, newHarness)
 	})
@@ -246,6 +264,54 @@ func RunBenchmarks(b *testing.B, bkt *blob.Bucket) {
 	b.Run("BenchmarkWriteReadDelete", func(b *testing.B) {
 		benchmarkWriteReadDelete(b, bkt)
 	})
+}
+
+// testNonexistentBucket tests the functionality of IsAccessible.
+func testNonexistentBucket(t *testing.T, newHarness HarnessMaker) {
+	ctx := context.Background()
+	h, err := newHarness(ctx, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+
+	// Get a driver instance pointing to a nonexistent bucket.
+	{
+		drv, err := h.MakeDriverForNonexistentBucket(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if drv == nil {
+			// No such thing as a "nonexistent bucket" for this driver.
+			t.Skip()
+		}
+		b := blob.NewBucket(drv)
+		defer b.Close()
+		exists, err := b.IsAccessible(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if exists {
+			t.Error("got IsAccessible true for nonexistent bucket, want false")
+		}
+	}
+
+	// Verify that IsAccessible returns true for a real bucket.
+	{
+		drv, err := h.MakeDriver(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b := blob.NewBucket(drv)
+		defer b.Close()
+		exists, err := b.IsAccessible(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !exists {
+			t.Error("got IsAccessible false for real bucket, want true")
+		}
+	}
 }
 
 // testList tests the functionality of List.
@@ -1133,25 +1199,44 @@ func testAttributes(t *testing.T, newHarness HarnessMaker) {
 	if r.ContentType() != contentType {
 		t.Errorf("got Reader.ContentType() %q want %q", r.ContentType(), contentType)
 	}
+	if !a.CreateTime.IsZero() {
+		if a.CreateTime.After(a.ModTime) {
+			t.Errorf("CreateTime %v is after ModTime %v", a.CreateTime, a.ModTime)
+		}
+	}
+	if a.ModTime.IsZero() {
+		t.Errorf("ModTime not set")
+	}
 	if a.Size != int64(len(content)) {
 		t.Errorf("got Size %d want %d", a.Size, len(content))
 	}
 	if r.Size() != int64(len(content)) {
 		t.Errorf("got Reader.Size() %d want %d", r.Size(), len(content))
 	}
+	if a.ETag == "" {
+		t.Error("ETag not set")
+	}
+	// Some basic syntax checks on ETag based on https://en.wikipedia.org/wiki/HTTP_ETag.
+	// It should be of the form "xxxx" or W/"xxxx".
+	if !strings.HasPrefix(a.ETag, "W/\"") && !strings.HasPrefix(a.ETag, "\"") {
+		t.Errorf("ETag should start with W/\" or \" (got %s)", a.ETag)
+	}
+	if !strings.HasSuffix(a.ETag, "\"") {
+		t.Errorf("ETag should end with \" (got %s)", a.ETag)
+	}
 	r.Close()
 
-	t1 := a.ModTime
+	// Modify and re-fetch attributes.
 	if err := b.WriteAll(ctx, key, content, nil); err != nil {
 		t.Fatal(err)
 	}
+
 	a2, err := b.Attributes(ctx, key)
 	if err != nil {
 		t.Errorf("failed Attributes#2: %v", err)
 	}
-	t2 := a2.ModTime
-	if t2.Before(t1) {
-		t.Errorf("ModTime %v is before %v", t2, t1)
+	if a2.ModTime.Before(a.ModTime) {
+		t.Errorf("ModTime %v is before %v", a2.ModTime, a.ModTime)
 	}
 }
 
@@ -1740,7 +1825,14 @@ func testCopy(t *testing.T, newHarness HarnessMaker) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		wantAttr.ModTime = time.Time{} // don't compare this field
+
+		// Clear uncomparable fields.
+		clearUncomparableFields := func(a *blob.Attributes) {
+			a.CreateTime = time.Time{}
+			a.ModTime = time.Time{}
+			a.ETag = ""
+		}
+		clearUncomparableFields(wantAttr)
 
 		// Create another blob that we're going to overwrite.
 		if err := b.WriteAll(ctx, dstKeyExists, []byte("clobber me"), nil); err != nil {
@@ -1764,7 +1856,7 @@ func testCopy(t *testing.T, newHarness HarnessMaker) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gotAttr.ModTime = time.Time{} // don't compare this field
+		clearUncomparableFields(gotAttr)
 		if diff := cmp.Diff(gotAttr, wantAttr, cmpopts.IgnoreUnexported(blob.Attributes{})); diff != "" {
 			t.Errorf("got %v want %v diff %s", gotAttr, wantAttr, diff)
 		}
@@ -1787,7 +1879,7 @@ func testCopy(t *testing.T, newHarness HarnessMaker) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		gotAttr.ModTime = time.Time{} // don't compare this field
+		clearUncomparableFields(gotAttr)
 		if diff := cmp.Diff(gotAttr, wantAttr, cmpopts.IgnoreUnexported(blob.Attributes{})); diff != "" {
 			t.Errorf("got %v want %v diff %s", gotAttr, wantAttr, diff)
 		}
@@ -2342,6 +2434,13 @@ func testAs(t *testing.T, newHarness HarnessMaker, st AsTest) {
 		t.Error(err)
 	} else {
 		defer func() { _ = b.Delete(ctx, copyKey) }()
+	}
+
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
+		_, err = b.SignedURL(ctx, key, &blob.SignedURLOptions{Method: method, BeforeSign: st.BeforeSign})
+		if err != nil && gcerrors.Code(err) != gcerrors.Unimplemented {
+			t.Errorf("got err %v when signing url with method %q", err, method)
+		}
 	}
 }
 
