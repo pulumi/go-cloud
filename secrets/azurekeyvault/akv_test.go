@@ -92,23 +92,22 @@ func (h *harness) Close() {
 
 func newHarness(ctx context.Context, t *testing.T) (drivertest.Harness, error) {
 	// Use initEnv to setup your environment variables.
+	var client *keyvault.BaseClient
 	if *setup.Record {
 		initEnv()
+		var err error
+		client, err = Dial()
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		// Use a null authorizer for replay mode.
+		c := keyvault.NewWithoutDefaults()
+		client = &c
+		client.Authorizer = &autorest.NullAuthorizer{}
 	}
-
 	sender, done := setup.NewAzureKeyVaultTestClient(ctx, t)
-	client, err := Dial()
-	if err != nil {
-		return nil, err
-	}
 	client.Sender = sender
-
-	// Use a null authorizer for replay mode.
-	if !*setup.Record {
-		na := &autorest.NullAuthorizer{}
-		client.Authorizer = na
-	}
-
 	return &harness{
 		client: client,
 		close:  done,
@@ -169,6 +168,8 @@ func TestNoConnectionError(t *testing.T) {
 	}
 }
 
+// This test no longer works on MacOS, as OpenKeeper always fails with "MSI not available".
+/*
 func TestOpenKeeper(t *testing.T) {
 	tests := []struct {
 		URL     string
@@ -199,5 +200,71 @@ func TestOpenKeeper(t *testing.T) {
 				t.Errorf("%s: got error during close: %v", test.URL, err)
 			}
 		}
+	}
+}
+*/
+
+func TestKeyIDRE(t *testing.T) {
+	client := keyvault.NewWithoutDefaults()
+
+	testCases := []struct {
+		// input
+		keyID string
+
+		// output
+		keyVaultURI string
+		keyName     string
+		keyVersion  string
+	}{
+		{
+			keyID:       keyID1,
+			keyVaultURI: "https://go-cdk.vault.azure.net/",
+			keyName:     "test1",
+		},
+		{
+			keyID:       keyID2,
+			keyVaultURI: "https://go-cdk.vault.azure.net/",
+			keyName:     "test2",
+		},
+		{
+			keyID:       "https://mykeyvault.vault.azure.net/keys/mykey/myversion",
+			keyVaultURI: "https://mykeyvault.vault.azure.net/",
+			keyName:     "mykey",
+			keyVersion:  "myversion",
+		},
+		{
+			keyID:       "https://mykeyvault.vault.usgovcloudapi.net/keys/mykey/myversion",
+			keyVaultURI: "https://mykeyvault.vault.usgovcloudapi.net/",
+			keyName:     "mykey",
+			keyVersion:  "myversion",
+		},
+		{
+			keyID:       "https://mykeyvault.vault.region01.external.com/keys/mykey/myversion",
+			keyVaultURI: "https://mykeyvault.vault.region01.external.com/",
+			keyName:     "mykey",
+			keyVersion:  "myversion",
+		},
+	}
+
+	for _, testCase := range testCases {
+		t.Run(testCase.keyID, func(t *testing.T) {
+			k, err := openKeeper(&client, testCase.keyID, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer k.Close()
+
+			if k.keyVaultURI != testCase.keyVaultURI {
+				t.Errorf("got key vault URI %s, want key vault URI %s", k.keyVaultURI, testCase.keyVaultURI)
+			}
+
+			if k.keyName != testCase.keyName {
+				t.Errorf("got key name %s, want key name %s", k.keyName, testCase.keyName)
+			}
+
+			if k.keyVersion != testCase.keyVersion {
+				t.Errorf("got key version %s, want key version %s", k.keyVersion, testCase.keyVersion)
+			}
+		})
 	}
 }
